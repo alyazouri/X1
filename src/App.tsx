@@ -7,15 +7,15 @@ import { runApex, runApexDiagnostics, buildDeviceProfile, buildWeaponIntel, type
 import { ExpertSection } from "./ExpertSection";
 import { ApexPanel } from "./ApexPanel";
 import { Particles } from "./Particles";
+import { Aurora } from "./Aurora";
 import { LanguageSwitcher } from "./LanguageSwitcher";
 import { NetworkCenter } from "./net/NetworkCenter";
 import { JordanMatchmaking } from "./JordanMatchmaking";
-
 import { LiveUsersBadge } from "./LiveUsers";
 import {
   SectionHeader, RevealSection, SensitivityTable, CopyButton, ShareButton, AIPredictions,
   RatingSection, NightModeToggle,
-  PingMonitor, Hero, PWABanner, QuickSearch,
+  PingMonitor, Hero, PWABanner, QuickSearch, AuroraMark,
 } from "./ui";
 
 const PROFILES_KEY = "alyazouri_profiles";
@@ -29,6 +29,7 @@ export default function App() {
   const brand = useMemo(() => BRANDS.find((b) => b.id === brandId)!, [brandId]);
   const [deviceId, setDeviceId] = useState(BRANDS[0].devices[0].name);
   const device = useMemo(() => brand.devices.find((d) => d.name === deviceId) ?? brand.devices[0], [brand, deviceId]);
+
   // PPI derived from the device resolution for the Expert device model.
   const devicePpi = useMemo(() => {
     const rm = device.resolution.match(/(\d+)[×x](\d+)/);
@@ -36,24 +37,29 @@ export default function App() {
     const h = rm ? +rm[2] : 1080;
     return Math.sqrt(w * w + h * h) / device.screenSize;
   }, [device]);
+
   const [fingers, setFingers] = useState<number>(4);
   const [styleId, setStyleId] = useState("headshot");
   const [gyroMode, setGyroMode] = useState<GyroMode>("always");
   const [proProfile, setProProfile] = useState<string | undefined>(undefined);
   const [isSuperPower, setIsSuperPower] = useState(false);
+
   // ── ALYAZOURI GG (APEX ENGINE) state ──
   const [ggActive, setGgActive] = useState(false);
   const [ggMode, setGgMode] = useState<GGModeId>("balanced");
   const [ggTargetStyle, setGgTargetStyle] = useState<TargetStyle>("mixed");
   const [ggRange, setGgRange] = useState<CombatRange>("mixed");
   const [ggAimPriority, setGgAimPriority] = useState<AimPriority>("balanced");
+
   // Expert adaptive iteration override (locked FINAL profile from ExpertSection).
   const [expertOverride, setExpertOverride] = useState<SensitivityProfile | null>(null);
   const [expertFreeLook, setExpertFreeLook] = useState<Sens["freeLook"] | null>(null);
+
   const [weaponCatId, setWeaponCatId] = useState(WEAPONS[0].id);
   const weaponCat = useMemo(() => WEAPONS.find((c) => c.id === weaponCatId)!, [weaponCatId]);
   const [weaponId, setWeaponId] = useState(WEAPONS[0].weapons[0].name);
   const weapon = useMemo(() => weaponCat.weapons.find((w) => w.name === weaponId) ?? weaponCat.weapons[0], [weaponCat, weaponId]);
+
   const [profiles, setProfiles] = useState<SavedProfile[]>([]);
 
   useEffect(() => {
@@ -72,9 +78,9 @@ export default function App() {
     setExpertFreeLook(null);
   }, [device, weapon, fingers, styleId, gyroMode, ggMode, ggTargetStyle, ggRange, ggAimPriority]);
 
-  const handleExpertApply = (profile: SensitivityProfile, fl: Sens["freeLook"]) => {
+  const handleExpertApply = (profile: SensitivityProfile, fl?: Sens["freeLook"]) => {
     setExpertOverride(profile);
-    setExpertFreeLook(fl);
+    if (fl) setExpertFreeLook(fl);
   };
 
   const baseSens = useMemo(() => computeSensitivity({
@@ -147,6 +153,7 @@ export default function App() {
       if (found) { setBrandId(b.id); setDeviceId(name); return; }
     }
   };
+
   const selectWeapon = (catId: string, name: string) => {
     const c = WEAPONS.find((x) => x.id === catId); if (!c) return;
     setWeaponCatId(catId); setWeaponId(name);
@@ -160,14 +167,16 @@ export default function App() {
 
   return (
     <div dir={dir} className="relative min-h-screen">
-      <div className="app-bg-gold" />
+      {/* Interactive aurora mesh — reacts to the pointer, controls, scroll & tilt */}
+      <Aurora />
       <Particles />
+      <div className="aurora-grain" aria-hidden="true" />
       <div className="relative z-10">
         {/* ═══ NAVBAR ═══ */}
         <header className="fixed inset-x-0 top-0 z-50 border-b border-white/5 bg-[#05070c]/80 backdrop-blur-md">
           <div className="mx-auto flex h-[61px] max-w-7xl items-center justify-between gap-3 px-5">
             <a href="#top" className="flex items-center gap-2">
-              <span className="font-display text-xl font-black text-orange-400">A</span>
+              <AuroraMark className="h-8 w-8 shrink-0" />
               <span className="font-display text-sm font-black tracking-widest text-white">ALYAZOURI</span>
             </a>
             <nav className="hidden items-center gap-1 lg:flex">
@@ -186,10 +195,8 @@ export default function App() {
           </div>
         </header>
         <StatusBarLazy />
-
         <main id="top">
           <Hero />
-
           <div className="mx-auto max-w-7xl px-5 pb-24">
             {/* ═══ GENERATOR ═══ */}
             <section id="generator" className="mt-12 scroll-mt-24">
@@ -420,19 +427,19 @@ export default function App() {
 
                   <AIPredictions deviceName={device.name} fingers={fingers} styleId={styleId} weaponName={weapon.name} />
                   <div className="card rounded-2xl p-5">
-                      <h4 className="mb-3 font-display text-sm font-bold tracking-widest text-white/90">{t("stability_title", lang)}</h4>
-                      <div className="space-y-3">
-                        {[
-                          { label: t("stability_device", lang), value: (sens.factors.deviceFactor * 100).toFixed(0), color: "from-orange-500 to-red-500" },
-                          { label: t("stability_weapon", lang), value: (sens.factors.weaponFactor * 100).toFixed(0), color: "from-amber-500 to-orange-500" },
-                          { label: t("stability_fingers", lang), value: (sens.factors.fingerFactor * 100).toFixed(0), color: "from-emerald-500 to-teal-500" },
-                          { label: t("stability_style", lang), value: (sens.factors.styleFactor * 100).toFixed(0), color: "from-sky-500 to-indigo-500" },
-                        ].map((item) => (
-                          <div key={item.label} className="space-y-1"><div className="flex justify-between"><span className="text-xs text-white/70">{item.label}</span><span className="font-display text-xs font-bold text-white tabular-nums">{item.value}%</span></div><div className="h-1.5 overflow-hidden rounded-full bg-white/5"><span className={`block h-full rounded-full bg-gradient-to-r ${item.color}`} style={{ width: `${item.value}%` }} /></div></div>
-                        ))}
-                      </div>
-                      <p className="mt-3 text-[10px] text-white/40">{t("stability_equation", lang)}<br />{t("stability_desc", lang)}</p>
+                    <h4 className="mb-3 font-display text-sm font-bold tracking-widest text-white/90">{t("stability_title", lang)}</h4>
+                    <div className="space-y-3">
+                      {[
+                        { label: t("stability_device", lang), value: (sens.factors.deviceFactor * 100).toFixed(0), color: "from-orange-500 to-red-500" },
+                        { label: t("stability_weapon", lang), value: (sens.factors.weaponFactor * 100).toFixed(0), color: "from-amber-500 to-orange-500" },
+                        { label: t("stability_fingers", lang), value: (sens.factors.fingerFactor * 100).toFixed(0), color: "from-emerald-500 to-teal-500" },
+                        { label: t("stability_style", lang), value: (sens.factors.styleFactor * 100).toFixed(0), color: "from-sky-500 to-indigo-500" },
+                      ].map((item) => (
+                        <div key={item.label} className="space-y-1"><div className="flex justify-between"><span className="text-xs text-white/70">{item.label}</span><span className="font-display text-xs font-bold text-white tabular-nums">{item.value}%</span></div><div className="h-1.5 overflow-hidden rounded-full bg-white/5"><span className={`block h-full rounded-full bg-gradient-to-r ${item.color}`} style={{ width: `${item.value}%` }} /></div></div>
+                      ))}
                     </div>
+                    <p className="mt-3 text-[10px] text-white/40">{t("stability_equation", lang)}<br />{t("stability_desc", lang)}</p>
+                  </div>
                 </div>
               </div>
             </section>
@@ -487,7 +494,7 @@ export default function App() {
             <footer id="about" className="mt-20 scroll-mt-24">
               <div className="grid gap-8 md:grid-cols-3">
                 <div>
-                  <div className="flex items-center gap-3"><span className="font-display text-xl font-black text-orange-400">A</span><div><div className="font-display font-black tracking-widest text-white">ALYAZOURI</div><div className="text-[11px] text-white/50">Jordan Gaming Optimizer 2026</div></div></div>
+                  <div className="flex items-center gap-3"><AuroraMark className="h-9 w-9 shrink-0" /><div><div className="font-display font-black tracking-widest text-white">ALYAZOURI</div><div className="text-[11px] text-white/50">Jordan Gaming Optimizer 2026</div></div></div>
                   <p className="mt-4 text-sm text-white/60">{t("footer_about", lang)}</p>
                 </div>
                 <div>
@@ -517,11 +524,13 @@ export default function App() {
 
 /* ═══ Local components (kept here to mirror original structure) ═══ */
 import { StatusBar } from "./ui";
+
 function StatusBarLazy() { return <StatusBar />; }
 
 /* ══════════ MusicPlayer (YouTube ambient music) ══════════ */
 const MUSIC_MUTED_KEY = "alyazouri_music_muted";
 const YOUTUBE_VIDEO_ID = "x-DJKKK8kns";
+
 function MusicPlayer() {
   const { lang } = useLang();
   const isAr = lang === "ar";
@@ -562,6 +571,7 @@ function MusicPlayer() {
   }, []);
 
   const startPlayback = () => { const p = playerRef.current; if (!p) return; try { p.setVolume(40); p.playVideo(); setPlaying(true); } catch { /* */ } };
+
   useEffect(() => {
     if (!ready || muted) return;
     const handler = () => startPlayback();
@@ -577,6 +587,7 @@ function MusicPlayer() {
     if (muted || !playing) { try { p.setVolume(40); p.playVideo(); } catch { /* */ } setMuted(false); setPlaying(true); try { localStorage.setItem(MUSIC_MUTED_KEY, "false"); } catch { /* */ } }
     else { try { p.pauseVideo(); } catch { /* */ } setMuted(true); setPlaying(false); try { localStorage.setItem(MUSIC_MUTED_KEY, "true"); } catch { /* */ } }
   };
+
   return (
     <button onClick={toggleMute} title={isAr ? (playing && !muted ? "كتم الموسيقى" : "تشغيل الموسيقى") : (playing && !muted ? "Mute music" : "Play music")}
       className={`relative flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-semibold transition-all ${playing && !muted ? "border border-orange-400/30 bg-orange-500/10 text-orange-300" : "btn-ghost"}`}>

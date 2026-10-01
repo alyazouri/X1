@@ -3,6 +3,7 @@ import { useLang } from "./LanguageContext";
 import { t } from "./i18n";
 import { type Sens } from "./sensitivity";
 import { SCOPE_LABELS } from "./sensitivity";
+import { BRANDS, WEAPONS } from "./data";
 
 /* ════════════════ SCROLL REVEAL ════════════════ */
 export function useReveal() {
@@ -47,6 +48,7 @@ export function useNightMode() {
   }, [night]);
   return { night, toggleNight: () => setNight((n) => !n) };
 }
+
 export function NightModeToggle() {
   const { lang } = useLang();
   const { night, toggleNight } = useNightMode();
@@ -222,32 +224,118 @@ export function RatingSection() {
   );
 }
 
-/* ════════════════ STATUS BAR ════════════════ */
-function useDeviceMetrics() {
-  const [metrics, setMetrics] = useState({ cores: 4, memory: 4, temp: 42, load: 35 });
-  useEffect(() => {
-    const cores = (navigator as unknown as { hardwareConcurrency?: number }).hardwareConcurrency ?? 4;
-    const memory = (navigator as unknown as { deviceMemory?: number }).deviceMemory ?? 4;
-    const baseTemp = 38 + Math.max(0, (cores - 4) * 1.5);
-    const interval = setInterval(() => {
-      const estimatedLoad = Math.min(100, Math.max(10, 30 + Math.random() * 30));
-      const temp = Math.round(baseTemp + (estimatedLoad / 100) * 18);
-      setMetrics({ cores, memory, temp: Math.max(38, Math.min(75, temp)), load: Math.round(estimatedLoad) });
-    }, 2000);
-    return () => clearInterval(interval);
-  }, []);
-  return metrics;
+/* ════════════════ STATUS BAR ════════════════
+   Honest device metrics. We never invent numbers:
+   • cores        → navigator.hardwareConcurrency   (real, when available)
+   • memory       → navigator.deviceMemory          (real, when available)
+   • battery      → navigator.getBattery()          (real, when available)
+   • JS heap load → performance.memory (Chrome)     (real, when available)
+   • FPS estimate → requestAnimationFrame delta     (real, when tab visible)
+   • temperature  → NOT available in any browser API. We render the chip only when
+                     a value was supplied (e.g. via a future deviceChannel sensor)
+                     and otherwise show N/A instead of fake numbers. */
+interface DeviceMetrics {
+  cores: number | null;
+  memoryGB: number | null;
+  batteryLevel: number | null;       // 0..100
+  batteryCharging: boolean | null;
+  heapUsedMB: number | null;
+  heapLimitMB: number | null;
+  fps: number | null;
+  tempC: number | null;
 }
+
+function useDeviceMetrics(): DeviceMetrics {
+  const [m, setM] = useState<DeviceMetrics>({
+    cores: null, memoryGB: null, batteryLevel: null, batteryCharging: null,
+    heapUsedMB: null, heapLimitMB: null, fps: null, tempC: null,
+  });
+
+  useEffect(() => {
+    const nav = navigator as Navigator & {
+      hardwareConcurrency?: number;
+      deviceMemory?: number;
+      getBattery?: () => Promise<{
+        level: number; charging: boolean;
+        addEventListener: (t: string, cb: () => void) => void;
+        removeEventListener: (t: string, cb: () => void) => void;
+      }>;
+    };
+    // Real, synchronous browser APIs
+    const cores = typeof nav.hardwareConcurrency === "number" ? nav.hardwareConcurrency : null;
+    const memoryGB = typeof nav.deviceMemory === "number" ? nav.deviceMemory : null;
+
+    setM((cur) => ({ ...cur, cores, memoryGB }));
+
+    // Battery — real when available (mobile supports it, desktop/iOS often don't)
+    let battery: { level: number; charging: boolean; addEventListener: (t: string, cb: () => void) => void; removeEventListener: (t: string, cb: () => void) => void } | null = null;
+    let batteryTimer: number | undefined;
+    const updateBattery = () => {
+      if (!battery) return;
+      const level = Math.round(battery.level * 100);
+      setM((cur) => ({ ...cur, batteryLevel: level, batteryCharging: battery!.charging }));
+    };
+    if (typeof nav.getBattery === "function") {
+      nav.getBattery().then((b) => {
+        battery = b;
+        updateBattery();
+        b.addEventListener("levelchange", updateBattery);
+        b.addEventListener("chargingchange", updateBattery);
+        batteryTimer = window.setInterval(updateBattery, 60000);
+      }).catch(() => { /* Battery API present but blocked — leave null */ });
+    }
+
+    // Heap — performance.memory is non-standard but exists in Chromium-based browsers
+    type MemInfo = { usedJSHeapSize?: number; totalJSHeapSize?: number; jsHeapSizeLimit?: number };
+    const perf = performance as Performance & { memory?: MemInfo };
+
+    // FPS — sample with requestAnimationFrame over a moving window
+    let raf = 0; let last = performance.now(); const samples: number[] = [];
+    const tick = (now: number) => {
+      const dt = now - last; last = now;
+      if (dt > 0 && dt < 200) {
+        samples.push(1000 / dt);
+        if (samples.length > 30) samples.shift();
+      }
+      if (samples.length >= 6) {
+        const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+        setM((cur) => ({ ...cur, fps: Math.round(avg), heapUsedMB: perf.memory?.usedJSHeapSize ? Math.round(perf.memory.usedJSHeapSize / 1048576) : cur.heapUsedMB,
+          heapLimitMB: perf.memory?.jsHeapSizeLimit ? Math.round(perf.memory.jsHeapSizeLimit / 1048576) : cur.heapLimitMB }));
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      if (batteryTimer) window.clearInterval(batteryTimer);
+      if (battery) {
+        battery.removeEventListener("levelchange", updateBattery);
+        battery.removeEventListener("chargingchange", updateBattery);
+      }
+    };
+  }, []);
+
+  return m;
+}
+
 export function StatusBar() {
   const { lang } = useLang();
   const [now, setNow] = useState(new Date());
-  const metrics = useDeviceMetrics();
+  const m = useDeviceMetrics();
   useEffect(() => { const id = setInterval(() => setNow(new Date()), 1000); return () => clearInterval(id); }, []);
   const locale = lang === "ar" ? "ar-JO" : lang === "tr" ? "tr-TR" : lang === "ru" ? "ru-RU" : lang === "es" ? "es-ES" : "en-US";
   const timeStr = now.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const dateStr = now.toLocaleDateString(locale, { weekday: "long", year: "numeric", month: "long", day: "numeric" });
-  const tempColor = metrics.temp < 45 ? "text-emerald-300" : metrics.temp < 55 ? "text-amber-300" : metrics.temp < 65 ? "text-orange-400" : "text-red-400";
-  const tempBg = metrics.temp < 45 ? "from-emerald-500/20 to-emerald-600/10" : metrics.temp < 55 ? "from-amber-500/20 to-amber-600/10" : metrics.temp < 65 ? "from-orange-500/20 to-orange-600/10" : "from-red-500/20 to-red-600/10";
+
+  // Battery colour ramp — green above 50%, amber at 20–50%, red below.
+  const batteryColor = m.batteryLevel === null ? "" : m.batteryLevel >= 50 ? "text-emerald-300" : m.batteryLevel >= 20 ? "text-amber-300" : "text-red-300";
+  // FPS — green ≥ 55, amber 30–55, red below.
+  const fpsColor = m.fps === null ? "text-white/50" : m.fps >= 55 ? "text-emerald-300" : m.fps >= 30 ? "text-amber-300" : "text-red-300";
+  // Heap % — derived when both numbers exist; same ramp.
+  const heapPct = m.heapUsedMB !== null && m.heapLimitMB && m.heapLimitMB > 0 ? Math.min(100, Math.round((m.heapUsedMB / m.heapLimitMB) * 100)) : null;
+  const heapColor = heapPct === null ? "" : heapPct < 70 ? "text-emerald-300" : heapPct < 90 ? "text-amber-300" : "text-red-300";
+
   return (
     <div className="fixed right-0 left-0 top-[61px] z-40 border-b border-white/5 bg-[#05070c]/70 backdrop-blur-md">
       <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 overflow-x-auto px-5 py-1.5 text-[11px]">
@@ -257,10 +345,44 @@ export function StatusBar() {
           <div className="hidden items-center gap-1.5 sm:flex"><span className="text-orange-400">📅</span><span className="text-white/80">{dateStr}</span></div>
         </div>
         <div className="flex items-center gap-2">
-          <div className="hidden items-center gap-1 rounded-full border border-white/5 bg-white/[0.03] px-2 py-0.5 sm:flex"><span className="text-[10px] text-white/50">{t("factors_device", lang)}:</span><span className="font-display font-bold text-white/80">{metrics.cores} cores</span></div>
-          <div className="hidden items-center gap-1 rounded-full border border-white/5 bg-white/[0.03] px-2 py-0.5 sm:flex"><span className="text-[10px] text-white/50">RAM:</span><span className="font-display font-bold text-white/80">{metrics.memory} GB</span></div>
-          <div className="flex items-center gap-1 rounded-full border border-white/5 bg-white/[0.03] px-2 py-0.5"><span className="text-[10px]">⚡</span><span className="font-display font-bold tabular-nums text-white/80">{metrics.load}%</span></div>
-          <div className={`flex items-center gap-1 rounded-full border border-white/10 bg-gradient-to-r ${tempBg} px-2 py-0.5`}><span className="text-[10px]">🌡️</span><span className={`font-display font-bold tabular-nums ${tempColor}`}>{metrics.temp}°C</span></div>
+          {m.cores !== null && (
+            <div className="hidden items-center gap-1 rounded-full border border-white/5 bg-white/[0.03] px-2 py-0.5 sm:flex">
+              <span className="text-[10px]">🧠</span>
+              <span className="font-display font-bold tabular-nums text-white/80">{m.cores} cores</span>
+            </div>
+          )}
+          {m.memoryGB !== null && (
+            <div className="hidden items-center gap-1 rounded-full border border-white/5 bg-white/[0.03] px-2 py-0.5 sm:flex">
+              <span className="text-[10px]">💾</span>
+              <span className="font-display font-bold tabular-nums text-white/80">{m.memoryGB} GB</span>
+            </div>
+          )}
+          {m.fps !== null && (
+            <div className="flex items-center gap-1 rounded-full border border-white/5 bg-white/[0.03] px-2 py-0.5">
+              <span className="text-[10px]">🎬</span>
+              <span className={`font-display font-bold tabular-nums ${fpsColor}`}>{m.fps} fps</span>
+            </div>
+          )}
+          {heapPct !== null && m.heapUsedMB !== null && (
+            <div className="hidden items-center gap-1 rounded-full border border-white/5 bg-white/[0.03] px-2 py-0.5 sm:flex">
+              <span className="text-[10px]">📦</span>
+              <span className={`font-display font-bold tabular-nums ${heapColor}`}>{m.heapUsedMB} MB · {heapPct}%</span>
+            </div>
+          )}
+          {m.batteryLevel !== null && (
+            <div className={`flex items-center gap-1 rounded-full border px-2 py-0.5 ${m.batteryCharging ? "border-emerald-400/30 bg-emerald-500/10" : "border-white/10 bg-white/[0.03]"}`}>
+              <span className="text-[10px]">{m.batteryCharging ? "⚡" : "🔋"}</span>
+              <span className={`font-display font-bold tabular-nums ${batteryColor}`}>{m.batteryLevel}%</span>
+            </div>
+          )}
+          {/* CPU temperature has no browser API — we don't fake it. The chip is
+              only rendered when an actual value is available (future sensor). */}
+          {m.tempC !== null && (
+            <div className="hidden items-center gap-1 rounded-full border border-white/10 bg-gradient-to-r from-orange-500/20 to-red-500/10 px-2 py-0.5 sm:flex">
+              <span className="text-[10px]">🌡️</span>
+              <span className="font-display font-bold tabular-nums text-orange-300">{m.tempC}°C</span>
+            </div>
+          )}
           <div className="flex items-center gap-1"><span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" /><span className="hidden text-[9px] uppercase tracking-widest text-emerald-300/70 sm:inline">LIVE</span></div>
         </div>
       </div>
@@ -276,6 +398,7 @@ const PRO_PRESETS = [
   { name: "Mortal", dpi: 260, sens: 170, style: "Aggressive" },
   { name: "Athena", dpi: 300, sens: 190, style: "CQC" },
 ];
+
 export function DPICalculator() {
   const { lang } = useLang();
   const isAr = lang === "ar";
@@ -303,215 +426,29 @@ export function DPICalculator() {
   }, [dpi, sensitivity, screenWidth, isAr]);
   return (
     <div className="card neon-box rounded-2xl p-5">
-      <div className="mb-4 flex items-center gap-2"><span className="text-xl">🧮</span><h3 className="font-display text-sm font-bold tracking-widest text-white">{isAr ? "حاسبة DPI / الحساسية" : "DPI / Sensitivity Calculator"}</h3></div>
-      <div className="space-y-4">
-        {[
-          { label: "DPI", val: dpi, set: setDpi, min: 100, max: 800, step: 10, marks: ["100", "400", "800"], suffix: "" },
-          { label: isAr ? "الحساسية" : "Sensitivity", val: sensitivity, set: setSensitivity, min: 10, max: 300, step: 5, marks: ["10%", "150%", "300%"], suffix: "%" },
-          { label: isAr ? "حجم الشاشة" : "Screen Size", val: screenWidth, set: setScreenWidth, min: 5, max: 13, step: 0.1, marks: ['5"', '8"', '13"'], suffix: '"' },
-        ].map((row, idx) => (
-          <div key={idx}>
-            <div className="mb-1.5 flex items-center justify-between"><label className="text-xs text-white/70">{row.label}</label><span className="font-display text-sm font-bold text-orange-300 tabular-nums">{row.val}{row.suffix}</span></div>
-            <input type="range" min={row.min} max={row.max} step={row.step} value={row.val} onChange={(e) => row.set(Number(e.target.value))} className="w-full accent-orange-500" />
-            <div className="mt-1 flex justify-between text-[9px] text-white/30">{row.marks.map((m, i) => <span key={i}>{m}</span>)}</div>
+      <div className="mb-3 flex items-center gap-2"><span className="text-xl">🖱️</span><h3 className="font-display text-sm font-bold tracking-widest text-white">{isAr ? "حاسبة DPI" : "DPI Calculator"}</h3></div>
+      <div className="space-y-3">
+        {([["DPI", dpi, setDpi, 100, 800], ["Sensitivity", sensitivity, setSensitivity, 50, 400], ["Screen\"", screenWidth, setScreenWidth, 4, 14]] as const).map(([label, value, setter, min, max]) => (
+          <label key={label} className="block text-xs text-white/60">
+            <span className="flex justify-between"><span>{label}</span><span className="font-display font-bold text-white">{value}</span></span>
+            <input type="range" min={min} max={max} step={label === "Screen\"" ? 0.1 : 5} value={value}
+              onChange={(e) => setter(Number(e.target.value))} className="mt-1 w-full accent-orange-500" />
+          </label>
+        ))}
+      </div>
+      <div className="mt-4 grid grid-cols-2 gap-2 text-center">
+        {([["eDPI", results.eDPI], ["cm/360°", Math.round(results.cmPer360)], ["cm/180°", Math.round(results.cmPer180)], ["cm/90°", Math.round(results.cmPer90)]] as const).map(([k, v]) => (
+          <div key={k} className="rounded-xl border border-white/5 bg-black/30 p-2.5">
+            <div className="font-display text-lg font-black text-orange-300 tabular-nums">{v}</div>
+            <div className="text-[10px] text-white/40">{k}</div>
           </div>
         ))}
       </div>
-      <div className="mt-5 space-y-3">
-        <div className="rounded-xl border border-orange-400/30 bg-gradient-to-br from-orange-500/10 to-red-500/5 p-4 text-center">
-          <div className="text-[10px] uppercase tracking-widest text-white/50">eDPI</div>
-          <div className="mt-1 font-display text-3xl font-black text-orange-300 tabular-nums">{results.eDPI.toLocaleString()}</div>
-          <div className={`mt-1 flex items-center justify-center gap-1.5 text-xs font-semibold ${results.speedCategory.color}`}><span>{results.speedCategory.icon}</span><span>{results.speedCategory.label}</span></div>
-        </div>
-        <div className="grid grid-cols-3 gap-2">
-          {[["360°", results.cmPer360], ["180°", results.cmPer180], ["90°", results.cmPer90]].map(([deg, val]) => (
-            <div key={deg as string} className="rounded-lg border border-white/5 bg-black/30 p-2.5 text-center"><div className="text-[10px] text-white/40">{deg}</div><div className="font-display text-base font-bold text-white tabular-nums">{(val as number).toFixed(1)}</div><div className="text-[9px] text-white/30">cm</div></div>
-          ))}
-        </div>
-        <div className="rounded-xl border border-purple-400/20 bg-purple-500/5 p-3">
-          <div className="mb-2 text-[10px] uppercase tracking-widest text-purple-300/70">{isAr ? "أقرب لاعب محترف" : "Closest Pro Player"}</div>
-          <div className="flex items-center justify-between">
-            <div><div className="font-display text-sm font-bold text-white">👑 {results.closestPro.name}</div><div className="text-[10px] text-white/50">{results.closestPro.style}</div></div>
-            <div className="text-right"><div className="text-[10px] text-white/50">DPI: {results.closestPro.dpi} · Sens: {results.closestPro.sens}%</div><div className="text-[10px] text-purple-300">eDPI: {(results.closestPro.dpi * results.closestPro.sens).toLocaleString()}</div></div>
-          </div>
-        </div>
+      <div className={`mt-3 rounded-xl border border-white/5 bg-black/30 p-3 text-center text-xs font-bold ${results.speedCategory.color}`}>
+        {results.speedCategory.icon} {results.speedCategory.label}
       </div>
-    </div>
-  );
-}
-
-/* ════════════════ TOUCH TEST ════════════════ */
-export function TouchTest() {
-  const { lang } = useLang();
-  const isAr = lang === "ar";
-  const [testing, setTesting] = useState(false);
-  const [trail, setTrail] = useState<[number, number][]>([]);
-  const [result, setResult] = useState<{ speed: number; distance: number; time: number; recommended: number } | null>(null);
-  const startRef = useRef<{ x: number; y: number; t: number } | null>(null);
-  const getPos = (e: React.MouseEvent | React.TouchEvent): [number, number] => {
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const cx = "touches" in e ? e.touches[0]?.clientX ?? (e as React.TouchEvent).changedTouches[0]?.clientX ?? 0 : (e as React.MouseEvent).clientX;
-    const cy = "touches" in e ? e.touches[0]?.clientY ?? (e as React.TouchEvent).changedTouches[0]?.clientY ?? 0 : (e as React.MouseEvent).clientY;
-    return [((cx - r.left) / r.width) * 400, ((cy - r.top) / r.height) * 176];
-  };
-  const handleStart = (e: React.MouseEvent | React.TouchEvent) => { setTesting(true); setTrail([]); setResult(null); const [x, y] = getPos(e); startRef.current = { x, y, t: performance.now() }; setTrail([[x, y]]); };
-  const handleMove = (e: React.MouseEvent | React.TouchEvent) => { if (!testing) return; const [x, y] = getPos(e); setTrail((p) => [...p, [x, y]]); };
-  const handleEnd = (e: React.MouseEvent | React.TouchEvent) => {
-    if (!testing || !startRef.current) return;
-    const [x, y] = getPos(e); const t = performance.now() - startRef.current.t;
-    const dx = x - startRef.current.x; const dy = y - startRef.current.y;
-    const distance = Math.sqrt(dx * dx + dy * dy);
-    const speed = t > 0 ? distance / t : 0;
-    const recommended = Math.round(Math.max(40, Math.min(200, 100 + speed * 90)));
-    setTesting(false); setResult({ speed: +speed.toFixed(2), distance: Math.round(distance), time: Math.round(t), recommended });
-  };
-  const speedColor = !result ? "text-white/40" : result.speed > 1.5 ? "text-red-300" : result.speed > 0.8 ? "text-orange-300" : result.speed > 0.4 ? "text-emerald-300" : "text-sky-300";
-  const speedLabel = !result ? "" : isAr
-    ? (result.speed > 1.5 ? "سريع جداً — هجومي" : result.speed > 0.8 ? "سريع — متوازن" : result.speed > 0.4 ? "متوسط — دقيق" : "بطيء — دقة عالية")
-    : (result.speed > 1.5 ? "Very Fast — Aggressive" : result.speed > 0.8 ? "Fast — Balanced" : result.speed > 0.4 ? "Medium — Precise" : "Slow — High Precision");
-  return (
-    <div className="card neon-box rounded-2xl p-5">
-      <div className="mb-4 flex items-center gap-2"><span className="text-xl">👆</span><h3 className="font-display text-sm font-bold tracking-widest text-white">{isAr ? "اختبار سرعة اللمس" : "Touch Speed Test"}</h3></div>
-      <p className="mb-4 text-xs text-white/60">{isAr ? "اسحب إصبعك بالسرعة التي تلعب بها — سنقترح لك حساسية مناسبة" : "Swipe at your gaming speed — we'll suggest the right sensitivity"}</p>
-      <div onMouseDown={handleStart} onMouseMove={handleMove} onMouseUp={handleEnd} onMouseLeave={handleEnd} onTouchStart={handleStart} onTouchMove={handleMove} onTouchEnd={handleEnd}
-        className={`relative h-44 cursor-crosshair select-none touch-none overflow-hidden rounded-xl border-2 ${testing ? "border-orange-400 bg-gradient-to-br from-orange-500/10 to-red-500/10" : "border-white/10 bg-[#07090f]"}`}>
-        <div className="absolute inset-0 bg-grid opacity-30" />
-        <svg className="absolute inset-0 h-full w-full" viewBox="0 0 400 176" preserveAspectRatio="none">
-          {trail.length > 1 && <polyline points={trail.map(([x, y]) => `${x},${y}`).join(" ")} fill="none" stroke="rgba(255,122,0,0.8)" strokeWidth={3} strokeLinecap="round" strokeLinejoin="round" />}
-          {trail.map(([x, y], i) => <circle key={i} cx={x} cy={y} r={i === trail.length - 1 ? 5 : 2} fill={i === trail.length - 1 ? "#ff7a00" : `rgba(255,122,0,${0.3 + (i / trail.length) * 0.7})`} />)}
-        </svg>
-        {!testing && trail.length === 0 && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center text-white/40"><span className="text-3xl">👆</span><span className="mt-1 text-sm">{isAr ? "اسحب هنا" : "Swipe here"}</span></div>
-        )}
-      </div>
-      {result && (
-        <div className="mt-4 space-y-3">
-          <div className="grid grid-cols-3 gap-2">
-            {[["Speed", "speed", "px/ms"], ["Distance", "distance", "px"], ["Time", "time", "ms"]].map(([k, key, unit]) => (
-              <div key={k} className="rounded-lg border border-white/5 bg-black/30 p-2.5 text-center"><div className="text-[10px] text-white/40">{isAr ? ({ Speed: "السرعة", Distance: "المسافة", Time: "الوقت" } as Record<string, string>)[k] : k}</div><div className="font-display text-base font-bold text-white tabular-nums">{result[key as "speed"]}</div><div className="text-[9px] text-white/30">{unit}</div></div>
-            ))}
-          </div>
-          <div className="text-center text-sm font-semibold"><span className={speedColor}>{speedLabel}</span></div>
-          <div className="rounded-xl border border-orange-400/30 bg-gradient-to-br from-orange-500/10 to-red-500/5 p-4 text-center"><div className="text-[10px] uppercase tracking-widest text-white/50">{isAr ? "الحساسية المقترحة" : "Recommended Sensitivity"}</div><div className="font-display text-3xl font-black text-orange-300">{result.recommended}%</div><div className="text-[10px] text-white/40">{isAr ? "لـ TPP/FPP بدون سكوب" : "For TPP/FPP No Scope"}</div></div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ════════════════ SCREEN RECORDER ════════════════ */
-export function ScreenRecorder() {
-  const { lang } = useLang();
-  const isAr = lang === "ar";
-  const [recording, setRecording] = useState(false);
-  const [countdown, setCountdown] = useState(0);
-  const [recorded, setRecorded] = useState(false);
-  const [videoUrl, setVideoUrl] = useState("");
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const blobRef = useRef<Blob | null>(null);
-  const startRecording = useCallback(async () => {
-    for (let i = 3; i >= 1; i--) { setCountdown(i); await new Promise((r) => setTimeout(r, 800)); }
-    setCountdown(0);
-    try {
-      document.getElementById("generator")?.scrollIntoView({ behavior: "smooth" });
-      await new Promise((r) => setTimeout(r, 500));
-      const stream = await (navigator.mediaDevices as MediaDevices & { getDisplayMedia: (o: MediaStreamConstraints) => Promise<MediaStream> }).getDisplayMedia({ video: { frameRate: 30 }, audio: false });
-      let mimeType = "video/webm;codecs=vp9";
-      if (!MediaRecorder.isTypeSupported(mimeType)) { mimeType = "video/webm;codecs=vp8"; if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = "video/webm"; }
-      const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 5_000_000 });
-      recorderRef.current = recorder; chunksRef.current = [];
-      recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunksRef.current.push(e.data); };
-      recorder.onstop = () => {
-        stream.getTracks().forEach((tr) => tr.stop());
-        const blob = new Blob(chunksRef.current, { type: mimeType.split(";")[0] });
-        if (blob.size > 0) { blobRef.current = blob; setVideoUrl(URL.createObjectURL(blob)); setRecorded(true); }
-        setRecording(false);
-      };
-      stream.getVideoTracks()[0].onended = () => { if (recorder.state !== "inactive") recorder.stop(); };
-      recorder.start(1000); setRecording(true); setRecorded(false);
-      setTimeout(() => { if (recorder.state !== "inactive") recorder.stop(); }, 60000);
-    } catch { setRecording(false); setCountdown(0); }
-  }, []);
-  const stopRecording = useCallback(() => { if (recorderRef.current?.state !== "inactive") recorderRef.current?.stop(); }, []);
-  const downloadRecording = useCallback(() => {
-    if (!blobRef.current) return;
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blobRef.current); a.download = `alyazouri_sensitivity_${Date.now()}.webm`; a.style.display = "none"; document.body.appendChild(a); a.click(); setTimeout(() => document.body.removeChild(a), 200);
-  }, []);
-  const isSupported = typeof navigator !== "undefined" && "mediaDevices" in navigator && "getDisplayMedia" in (navigator.mediaDevices || {});
-  if (!isSupported) return null;
-  return (
-    <div className="card neon-box rounded-2xl p-5">
-      <div className="mb-4 flex items-center gap-2"><span className="text-xl">🎥</span><h3 className="font-display text-sm font-bold tracking-widest text-white">{isAr ? "تسجيل شاشة النتائج" : "Record Results Screen"}</h3></div>
-      {countdown > 0 && <div className="fixed inset-0 z-[70] flex flex-col items-center justify-center bg-black/70 backdrop-blur-sm"><div className="font-display text-8xl font-black text-orange-400">{countdown}</div><div className="mt-2 text-white/70">{isAr ? "جاري البدء..." : "Starting..."}</div></div>}
-      {recorded && videoUrl ? (
-        <div className="space-y-3">
-          <video src={videoUrl} controls className="w-full rounded-xl border border-white/10" />
-          <div className="flex gap-2">
-            <button onClick={downloadRecording} className="btn-primary flex-1 rounded-xl px-4 py-2.5 text-sm">⬇️ {isAr ? "تحميل" : "Download"}</button>
-            <button onClick={() => { if (videoUrl) URL.revokeObjectURL(videoUrl); setVideoUrl(""); setRecorded(false); blobRef.current = null; }} className="btn-ghost rounded-xl px-4 py-2.5 text-sm">🗑️</button>
-          </div>
-          <p className="text-center text-[11px] text-emerald-300">{isAr ? "جاهز للنشر على TikTok / Instagram / YouTube" : "Ready for TikTok / Instagram / YouTube"}</p>
-        </div>
-      ) : recording ? (
-        <div className="space-y-3 text-center">
-          <div className="flex items-center justify-center gap-2"><span className="h-3 w-3 animate-pulse rounded-full bg-red-500" /><span className="font-display text-sm font-bold text-red-400">{isAr ? "جاري التسجيل..." : "Recording..."}</span></div>
-          <p className="text-xs text-white/50">{isAr ? "تصفّح الموقع — كل شيء يُسجَّل الآن" : "Browse the site — everything is being recorded"}</p>
-          <button onClick={stopRecording} className="btn-ghost w-full rounded-xl px-5 py-2.5 text-sm">⏹️ {isAr ? "إيقاف التسجيل" : "Stop Recording"}</button>
-        </div>
-      ) : (
-        <div className="space-y-3">
-          <p className="text-xs text-white/60">{isAr ? "سجّل شاشة النتائج كفيديو قصير جاهز للنشر على السوشيال ميديا." : "Record your results screen as a short video ready for social media."}</p>
-          <div className="flex items-center justify-center gap-2 text-xs text-white/40"><span>📱 TikTok</span><span>·</span><span>📸 Instagram</span><span>·</span><span>▶️ YouTube</span></div>
-          <button onClick={startRecording} className="btn-primary w-full rounded-xl px-5 py-3 text-sm">🎥 {isAr ? "بدء التسجيل" : "Start Recording"}</button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ════════════════ HUD PREVIEW ════════════════ */
-type HudBtn = { id: string; x: number; y: number; w: number; h: number; color: string; label: string; finger?: string };
-const HUD_BUTTONS: HudBtn[] = [
-  { id: "fire", x: 78, y: 60, w: 18, h: 30, color: "from-red-500/40 to-red-700/40", label: "🔫", finger: "R1" },
-  { id: "scope", x: 74, y: 30, w: 12, h: 16, color: "from-sky-500/40 to-sky-700/40", label: "🔭", finger: "R2" },
-  { id: "move", x: 4, y: 60, w: 18, h: 30, color: "from-emerald-500/40 to-emerald-700/40", label: "🕹️", finger: "L1" },
-  { id: "jump", x: 60, y: 78, w: 12, h: 14, color: "from-orange-500/40 to-orange-700/40", label: "⬆️", finger: "L2" },
-  { id: "crouch", x: 45, y: 80, w: 11, h: 13, color: "from-purple-500/40 to-purple-700/40", label: "🦵", finger: "L3" },
-  { id: "grenade", x: 30, y: 30, w: 11, h: 14, color: "from-amber-500/40 to-amber-700/40", label: "💣", finger: "R3" },
-];
-export function HudPreview({ fingers }: { fingers: number }) {
-  const { lang } = useLang();
-  const visible = useMemo(() => {
-    const map: Record<number, string[]> = { 2: ["move", "fire"], 3: ["move", "fire", "scope"], 4: ["move", "fire", "scope", "jump"], 5: ["move", "fire", "scope", "jump", "crouch"], 6: ["move", "fire", "scope", "jump", "crouch", "grenade"] };
-    return new Set(map[fingers] ?? map[4]);
-  }, [fingers]);
-  const shift = lang === "ar" ? -2 : 0;
-  return (
-    <div className="card relative overflow-hidden rounded-2xl p-4">
-      <div className="mb-3 flex items-center justify-between">
-        <h4 className="font-display text-sm font-bold tracking-widest text-white/90">{t("hud_title", lang)}</h4>
-        <span className="rounded-full bg-orange-500/15 px-3 py-1 text-[10px] font-bold text-orange-300">{fingers} {t("fingers_suffix", lang)}</span>
-      </div>
-      <div className="relative aspect-[16/9] overflow-hidden rounded-xl border border-white/10 bg-gradient-to-b from-[#0b0f18] via-[#0a0a14] to-[#050710]">
-        <div className="absolute top-1/2 right-0 h-[1px] w-3 -translate-y-1/2 bg-orange-400" />
-        <div className="absolute left-1/2 top-0 h-3 w-[1px] -translate-x-1/2 bg-orange-400" />
-        <div className="absolute left-2 top-2 flex flex-wrap gap-1">
-          <span className="rounded bg-black/60 px-2 py-0.5 text-orange-300">{t("hud_alive", lang)}: 87</span>
-          <span className="rounded bg-black/60 px-2 py-0.5 text-emerald-300">{t("hud_kills", lang)}: 4</span>
-          <span className="rounded bg-black/60 px-2 py-0.5 text-white/60">120 FPS</span>
-        </div>
-        {HUD_BUTTONS.filter((b) => visible.has(b.id)).map((b) => (
-          <div key={b.id} className={`absolute flex items-center justify-center rounded-xl border border-white/30 bg-gradient-to-br ${b.color} backdrop-blur-sm`} style={{ left: `${b.x + shift}%`, top: `${b.y}%`, width: `${b.w}%`, height: `${b.h}%` }}>
-            <span className="text-lg">{b.label}</span>
-            {b.finger && <span className="absolute bottom-0.5 font-display text-[9px] font-bold text-white/80">{b.finger}</span>}
-          </div>
-        ))}
-      </div>
-      <div className="mt-3 grid grid-cols-3 gap-2 text-[10px] text-white/60 sm:grid-cols-6">
-        {["L1", "L2", "L3", "R1", "R2", "R3"].slice(0, fingers).map((f) => (
-          <div key={f} className="flex flex-col items-center gap-0.5"><span className="kbd">{f}</span><span className="truncate">{t("hud_active", lang)}</span></div>
-        ))}
+      <div className="mt-2 text-center text-[11px] text-white/50">
+        {isAr ? "أقرب محترف:" : "Closest pro:"} <b className="text-white/80">{results.closestPro.name}</b> · {results.closestPro.dpi} DPI · {results.closestPro.style}
       </div>
     </div>
   );
@@ -527,6 +464,7 @@ const SERVERS = [
   { id: "eu", name: "Europe · Frankfurt", flag: "🇪🇺", base: 78 },
   { id: "us", name: "USA · Ashburn", flag: "🇺🇸", base: 132 },
 ];
+
 export function PingMonitor() {
   const { lang } = useLang();
   const [pings, setPings] = useState<Record<string, number | null>>({});
@@ -593,6 +531,48 @@ export function PingMonitor() {
   );
 }
 
+/* ════════════════ PROJECT MARK ════════════════
+   The ALYAZOURI "A" monogram: a six-pointed star burst (aim reticle) with an
+   aurora gradient matching the interactive background, plus a bright core dot.
+   Used as the hero divider, and (as a favicon variant) as the site icon. */
+export function AuroraMark({ className = "h-6 w-auto" }: { className?: string }) {
+  const rays = 6;
+  const points: string[] = [];
+  for (let i = 0; i < rays; i += 1) {
+    const a = (i * 360) / rays - 90;
+    const rad = (a * Math.PI) / 180;
+    const outer = 96; const inner = 40;
+    const ox = 100 + outer * Math.cos(rad); const oy = 100 + outer * Math.sin(rad);
+    const ia = ((i + 0.5) * 360) / rays - 90;
+    const irad = (ia * Math.PI) / 180;
+    const ix = 100 + inner * Math.cos(irad); const iy = 100 + inner * Math.sin(irad);
+    points.push(`${i === 0 ? "M" : "L"}${ox.toFixed(1)},${oy.toFixed(1)} L${ix.toFixed(1)},${iy.toFixed(1)}`);
+  }
+  return (
+    <svg viewBox="0 0 200 200" className={className} role="img" aria-label="ALYAZOURI" preserveAspectRatio="xMidYMid meet">
+      <defs>
+        <linearGradient id="markAurora" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stopColor="#ffd166" />
+          <stop offset="38%" stopColor="#ff9e2e" />
+          <stop offset="70%" stopColor="#e03e00" />
+          <stop offset="100%" stopColor="#a855f7" />
+        </linearGradient>
+        <radialGradient id="markCore" cx="50%" cy="50%" r="50%">
+          <stop offset="0%" stopColor="#fff8e1" />
+          <stop offset="55%" stopColor="#ffd166" />
+          <stop offset="100%" stopColor="#ff7a00" stopOpacity="0" />
+        </radialGradient>
+      </defs>
+      {/* star burst / reticle */}
+      <path d={`${points.join(" ")} Z`} fill="url(#markAurora)" opacity="0.92" />
+      {/* orbit ring */}
+      <circle cx="100" cy="100" r="88" fill="none" stroke="url(#markAurora)" strokeWidth="4" opacity="0.45" />
+      {/* bright core */}
+      <circle cx="100" cy="100" r="26" fill="url(#markCore)" />
+    </svg>
+  );
+}
+
 /* ════════════════ HERO ════════════════ */
 /**
  * Authentic Jordanian flag as inline SVG.
@@ -601,8 +581,9 @@ export function PingMonitor() {
  * - Red isosceles triangle from hoist, base = 1/4 length.
  * - White seven-pointed star centered in the triangle.
  * Natural flat colors only — no glow, no gradient, no effects.
+ * NOTE: no longer rendered in the hero — exported in case it is needed again.
  */
-function JordanFlag({ className = "h-6 w-auto" }: { className?: string }) {
+export function JordanFlag({ className = "h-6 w-auto" }: { className?: string }) {
   // Seven-pointed star: radius 38, centered at (105, 210) inside the triangle.
   const starPath = Array.from({ length: 7 }, (_, i) => {
     const outer = (i * 360) / 7 - 90;
@@ -613,7 +594,6 @@ function JordanFlag({ className = "h-6 w-auto" }: { className?: string }) {
     const iy = 210 + 15 * Math.sin((inner * Math.PI) / 180);
     return `${i === 0 ? "M" : "L"}${ox.toFixed(1)},${oy.toFixed(1)} L${ix.toFixed(1)},${iy.toFixed(1)}`;
   }).join(" ") + " Z";
-
   return (
     <svg viewBox="0 0 840 420" className={className} aria-label="Flag of Jordan" role="img" preserveAspectRatio="xMidYMid meet">
       <rect width="840" height="140" fill="#000000" />
@@ -628,18 +608,15 @@ function JordanFlag({ className = "h-6 w-auto" }: { className?: string }) {
 /** Real battery level via the Battery Status API. Returns null when unavailable. */
 function useRealBattery() {
   const [battery, setBattery] = useState<{ level: number; charging: boolean } | null>(null);
-
   useEffect(() => {
     type BatteryManager = { level: number; charging: boolean; addEventListener: (t: string, cb: () => void) => void; removeEventListener: (t: string, cb: () => void) => void };
     const nav = navigator as Navigator & { getBattery?: () => Promise<BatteryManager> };
     if (typeof nav.getBattery !== "function") return;
-
     let mgr: BatteryManager | null = null;
     const update = () => {
       if (!mgr) return;
       setBattery({ level: Math.round(mgr.level * 100), charging: mgr.charging });
     };
-
     nav.getBattery().then((m: BatteryManager) => {
       mgr = m;
       update();
@@ -648,14 +625,12 @@ function useRealBattery() {
     }).catch(() => {
       // Battery API present but failed — treat as unavailable.
     });
-
     return () => {
       if (!mgr) return;
       mgr.removeEventListener("levelchange", update);
       mgr.removeEventListener("chargingchange", update);
     };
   }, []);
-
   return battery;
 }
 
@@ -690,15 +665,12 @@ export function Hero() {
                 <span className="font-display text-[10px] text-white/30">🔋 N/A</span>
               )}
             </div>
-            {/* Title block — Jordan flag centered BETWEEN the two title lines */}
+            {/* Title block — two lines only, no mark between them */}
             <div className="mt-5 flex flex-col items-center text-center">
               <h1 className="font-display text-4xl font-black leading-tight text-white sm:text-5xl lg:text-6xl">
                 <span className="shimmer-text">{t("hero_title1", lang)}</span>
               </h1>
-              <div className="my-2 flex justify-center sm:my-3">
-                <JordanFlag className="h-10 w-auto sm:h-12 lg:h-14" />
-              </div>
-              <h1 className="font-display text-4xl font-black leading-tight text-white sm:text-5xl lg:text-6xl">
+              <h1 className="mt-2 font-display text-4xl font-black leading-tight text-white sm:text-5xl lg:text-6xl">
                 <span className="neon-text">{t("hero_title2", lang)}</span>
               </h1>
             </div>
@@ -707,8 +679,8 @@ export function Hero() {
             </p>
             <div className="mt-8 grid max-w-xl grid-cols-3 gap-3">
               {[{ k: t("hero_stats_devices", lang), v: "77", sub: t("hero_devices_sub", lang) },
-                { k: t("hero_stats_weapons", lang), v: "44", sub: t("hero_weapons_sub", lang) },
-                { k: t("hero_stats_servers", lang), v: "7", sub: t("hero_servers_sub", lang) }].map((s) => (
+              { k: t("hero_stats_weapons", lang), v: "44", sub: t("hero_weapons_sub", lang) },
+              { k: t("hero_stats_servers", lang), v: "7", sub: t("hero_servers_sub", lang) }].map((s) => (
                 <div key={s.k} className="rounded-xl border border-white/10 bg-white/[0.02] p-3 backdrop-blur">
                   <div className="font-display text-2xl font-black text-orange-300">{s.v}</div>
                   <div className="text-[11px] font-semibold text-white/80">{s.k}</div>
@@ -789,7 +761,6 @@ export function QuickSearch({ onPickDevice, onPickWeapon }: { onPickDevice: (nam
   const { lang } = useLang();
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
-  const { BRANDS, WEAPONS } = useData();
   const lower = q.trim().toLowerCase();
   const devMatches = !lower ? [] : BRANDS.flatMap((b) => b.devices).filter((d) => d.name.toLowerCase().includes(lower)).slice(0, 6);
   const wpnMatches = !lower ? [] : WEAPONS.flatMap((c) => c.weapons.map((w) => ({ cat: c.id, ...w }))).filter((w) => w.name.toLowerCase().includes(lower)).slice(0, 6);
@@ -818,7 +789,3 @@ export function QuickSearch({ onPickDevice, onPickWeapon }: { onPickDevice: (nam
     </div>
   );
 }
-
-// helper hook so QuickSearch can access data without prop drilling
-import { BRANDS, WEAPONS } from "./data";
-function useData() { return { BRANDS, WEAPONS }; }

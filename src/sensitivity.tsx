@@ -4,7 +4,7 @@ import { getWeaponProfile } from "./weaponProfiles";
 import { PRO_PROFILES } from "./data";
 
 // ─── Sensitivity value object: [TPP, FPP, Red, 2x, 3x, 4x, 6x, 8x] as named keys ───
-type SensObj = {
+export type SensObj = {
   tpp: number; fpp: number; red: number;
   scope2: number; scope3: number; scope4: number; scope6: number; scope8: number;
 };
