@@ -218,73 +218,111 @@ export function validationIssues(profile: SensitivityProfile): string[] {
       const value = profile[engine][scope];
       values.push(value);
       if (!Number.isFinite(value)) issues.push(`${engine}.${scope}: non-finite`);
-      if (value < 1 || value > maxFor(engine)) issues.push(`${engine}.${scope}: out-of-range`);
+      if (value < BOUNDS.cam.min) issues.push(`${engine}.${scope}: below ${BOUNDS.cam.min}`);
+      const max = maxFor(engine);
+      if (value > max) issues.push(`${engine}.${scope}: above ${max}`);
     }
-    if (new Set(values).size < 4) issues.push(`${engine}: insufficient scope separation`);
+    // A scope curve that collapsed to a single value is not a real profile.
+    if (new Set(values).size < 3) issues.push(`${engine}: insufficient scope separation`);
   }
-  const gyroDifferences = SCOPES.filter(
+  const gyroSeparation = SCOPES.filter(
     (scope) => profile.gyroCam[scope] !== profile.gyroAds[scope],
   ).length;
-  if (gyroDifferences < 2) issues.push("gyroCam/gyroAds: insufficient independent separation");
+  if (gyroSeparation < 2) issues.push("gyroCam/gyroAds: insufficient independent separation");
   return issues;
 }
 
-export function attribution(input: ApexInput, output: OptimizeOutput): FactorAttribution[] {
-  const context = output.ctx;
-  const avgDevice = ENGINES.reduce(
-    (sum, engine) => sum + context.device.engineGain[engine],
-    0,
-  ) / ENGINES.length;
-  const finger = Math.abs(FINGER_MODEL[input.fingers].engineGain.gyroCam - 1) * 100;
-  const gyro = Math.abs(GYRO_MODEL[input.gyroMode].engineGain.gyroCam - 1) * 100;
-  const target = Math.abs(
-    context.targetAngularSpeed / context.referenceAngularSpeed - 1,
-  ) * 2.5;
-  const mode = MODE_REGISTRY[input.mode];
-  const values = [
-    { factor: "device", label: "Device / screen / response", delta: (avgDevice - 1) * 100 },
-    { factor: "recoil", label: "Weapon recoil + fire rate", delta: context.recoilDelta * 4.5 },
-    { factor: "gyro", label: "Gyroscope mode", delta: GYRO_MODEL[input.gyroMode].engineGain.gyroCam - 1 < 0 ? -gyro : gyro },
-    { factor: "target", label: "Target speed + distance", delta: target * Math.sign(context.targetAngularSpeed - context.referenceAngularSpeed) },
-    { factor: "finger", label: "Finger input geometry", delta: (input.fingers < 5 ? -finger : finger) },
-    { factor: "mode", label: "Advanced calibration mode", delta: (mode.speedBias + mode.recoilBias - mode.precisionBias) * 50 },
+/** Per-factor attribution: how far each input moved the discovered solution. */
+export function attribution(
+  input: ApexInput,
+  optimized: OptimizeOutput,
+): FactorAttribution[] {
+  const mean = (values: number[]): number =>
+    values.reduce((sum, value) => sum + value, 0) / Math.max(1, values.length);
+  const pct = (ratio: number): number => round(Math.abs(ratio - 1) * 100, 1);
+  const directionOf = (ratio: number): FactorAttribution["direction"] =>
+    ratio - 1 > 0.0005 ? "up" : 1 - ratio > 0.0005 ? "down" : "neutral";
+
+  const deviceRatio = mean(Object.values(optimized.ctx.device.engineGain));
+  const fingerRatio = mean(Object.values(FINGER_MODEL[input.fingers].engineGain));
+  const gyroRatio = mean(Object.values(GYRO_MODEL[input.gyroMode].engineGain));
+  const recoilRatio = optimized.recoilCompFactor;
+
+  const entries: FactorAttribution[] = [
+    {
+      factor: "device",
+      label: `Device response (${input.device.name})`,
+      deltaPct: pct(deviceRatio),
+      direction: directionOf(deviceRatio),
+    },
+    {
+      factor: "fingers",
+      label: `${input.fingers}-finger geometry`,
+      deltaPct: pct(fingerRatio),
+      direction: directionOf(fingerRatio),
+    },
+    {
+      factor: "gyro",
+      label: `Gyro ${input.gyroMode}`,
+      deltaPct: pct(gyroRatio),
+      direction: directionOf(gyroRatio),
+    },
+    {
+      factor: "recoil",
+      label: `Recoil (${input.weapon.name})`,
+      deltaPct: pct(recoilRatio),
+      direction: directionOf(recoilRatio),
+    },
   ];
-  return values.map(({ factor, label, delta }) => ({
-    factor,
-    label,
-    deltaPct: round(Math.abs(delta), 1),
-    direction: delta > 0.25 ? "up" : delta < -0.25 ? "down" : "neutral",
-  }));
+  return entries.sort((a, b) => b.deltaPct - a.deltaPct);
 }
 
-export function confidence(input: ApexInput, margin: number): {
-  score: number; level: "low" | "medium" | "high";
-  margin: number; richness: number; iterations: number;
+/** Reliability of the discovered solution (margin × input richness). */
+export function confidence(
+  input: ApexInput,
+  avgMargin: number,
+): {
+  score: number;
+  level: "low" | "medium" | "high";
+  margin: number;
+  richness: number;
+  iterations: number;
 } {
-  const completeDevice = input.device.fps > 0 && input.device.touchRate > 0 &&
-    input.device.ppi > 0 && input.device.screenSize > 0;
-  const completeWeapon = input.weapon.fireRate > 0 &&
-    input.weapon.verticalRecoil >= 0 && input.weapon.horizontalRecoil >= 0;
-  const richness = (completeDevice ? 0.5 : 0.25) + (completeWeapon ? 0.5 : 0.25);
-  const score = Math.round(clamp(62 + richness * 23 + margin * 12, 0, 97));
+  const richnessInputs = [
+    input.device.fps > 0,
+    input.device.refreshRate > 0,
+    input.device.touchRate > 0,
+    input.device.screenSize > 0,
+    input.device.ppi > 0,
+    Boolean(input.device.resolution),
+    Boolean(input.weapon.name),
+    input.weapon.verticalRecoil >= 0,
+    input.weapon.fireRate > 0,
+    input.fingers >= 2,
+    input.gyroMode !== undefined,
+    input.mode !== undefined,
+  ];
+  const richness = richnessInputs.filter(Boolean).length / richnessInputs.length;
+  const score = Math.round(clamp(46 + avgMargin * 34 + richness * 20, 0, 99));
   return {
     score,
-    level: score >= 84 ? "high" : score >= 68 ? "medium" : "low",
-    margin: round(margin, 2),
-    richness: round(richness, 2),
+    level: score >= 80 ? "high" : score >= 62 ? "medium" : "low",
+    margin: round(avgMargin, 3),
+    richness: round(richness, 3),
     iterations: 1,
   };
 }
 
+/** Free-look values derived from the discovered camera profile. */
 export function freeLookFromProfile(
   input: ApexInput,
   profile: SensitivityProfile,
 ): { cam: number; parashoot: number; vehicle: number } {
-  const speedBias = MODE_REGISTRY[input.mode].speedBias;
-  const base = (profile.cam.tpp * 0.55 + profile.cam.fpp * 0.45) * (1 + speedBias * 0.35);
+  const cam = profile.cam.tpp;
+  const gyroBoost = input.gyroMode === "always" ? 1.02 : input.gyroMode === "scope" ? 1.01 : 1.0;
   return {
-    cam: Math.round(clamp(base * 0.76, 1, 300)),
-    parashoot: Math.round(clamp(base * 0.72, 1, 300)),
-    vehicle: Math.round(clamp(base * 0.68, 1, 300)),
+    cam: Math.round(clamp(cam, 1, 300)),
+    parashoot: Math.round(clamp(cam * 0.96 * gyroBoost, 1, 300)),
+    vehicle: Math.round(clamp(cam * 0.92 * gyroBoost, 1, 300)),
   };
 }
