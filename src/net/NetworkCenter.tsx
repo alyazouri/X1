@@ -1,535 +1,865 @@
 // ════════════════════════════════════════════════════════════════
-// ALYAZOURI NETWORK INTELLIGENCE CENTER
-// Unified DNS + Proxy measurement, verification & analysis platform.
-// NOC-quality interface with Command Center, live scan, NOC table,
-// evidence drawer, activity feed, ranking profiles, and export.
+// ALYAZOURI 2026 — NETWORK INTELLIGENCE CENTER
+//
+// The REAL test runs on the edge (netlify/functions/proxy-scan.mjs):
+//   • DNS  → a genuine DNS query over UDP/53 to the resolver (node:dns) with the
+//            real answer/RCODE, or a real TCP connect on 443 as ALIVE proof.
+//   • PROXY→ a genuine HTTP CONNECT handshake through the proxy.
+// The browser probes add a second, real signal (DoH + HTTPS RTT).
+//
+// Status vocabulary = the project's own (i18n dns_st_*). "UNSUPPORTED" is never
+// shown: when no evidence could be gathered in time the row is a TIMEOUT.
 // ════════════════════════════════════════════════════════════════
-import { useState, useMemo, useCallback, useRef } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useLang } from "../LanguageContext";
+import { t } from "../i18n";
 import { useNetworkDetection } from "../network/useNetwork";
-import { MASTER_DNS, MASTER_DNS_V6, inferIspAny, prefixOf } from "../dns/dataset";
-import { SAUDI_DNS, saudiIspOf } from "../dns/saudiDataset";
-import { PROXY_POOL, type ProxyEntry } from "../proxy/pool";
-import type { Endpoint, EndpointRecord, ScanProgress } from "./types";
-import type { DnsCountry } from "../dns/types";
-
-import { endpointId, freshnessOf } from "./stats";
-import { ScanController } from "./controller";
+import { endpointCity, distanceTo } from "../geo/distances";
+import { useGeolocation } from "../geo/useGeolocation";
 import {
-  StatusBadge, FreshnessBadge, MetricCard, ScanProgressBar,
-  ActivityFeed, EmptyState, ExportPanel,
-  type ActivityEntry,
-} from "./components";
-import { EvidenceDrawer } from "./EvidenceDrawer";
+  MASTER_DNS, MASTER_DNS_V6, fetchHost, inferIspAny, knownDnsEntry, searchDomainAny,
+} from "../dns/dataset";
+import { PROXY_POOL, PROXY_DUPLICATES_REMOVED, PROXY_RAW_COUNT, type ProxyEntry } from "../proxy/pool";
+import { fetchNodes, checkTcp } from "./CheckHost";
+import { RegionRouter } from "./RegionRouter";
 
-type Tab = "dns" | "proxy";
-type SortCol = "state" | "p50" | "p95" | "jitter" | "reliability" | "overall" | "confidence" | "endpoint";
-type SortDir = "asc" | "desc";
+/* ─────────────────── Tuning ─────────────────── */
+const SCREEN_DEADLINE_MS = 1100;
+const SCREEN_BATCH = 48;
+const REFINE_TOP = 10;
+const REFINE_ROUNDS = 3;
+const EDGE_CHUNK = 200;
 
-/* ── Build DNS endpoint pool ──────────────────────────────────── */
-function buildDnsEndpoints(country: DnsCountry) {
-  const pool = country === "Saudi Arabia" ? SAUDI_DNS : [...MASTER_DNS, ...MASTER_DNS_V6];
-  return pool.map((ip) => {
-    const isSaudi = country === "Saudi Arabia";
-    return {
-      id: endpointId(ip, 53, "dns"),
-      host: ip,
-      port: 53,
-      protocol: "dns" as const,
-      kind: "dns" as const,
-      isp: isSaudi ? saudiIspOf(ip) : inferIspAny(ip),
-      asn: "",
-      country,
-      catalogPrefix: prefixOf(ip),
-    };
+/* ─────────────────── Pipeline statuses (internal, never shown raw) ─────────────────── */
+export type EndpointStatus =
+  | "WORKING" | "PARTIAL" | "REACHABLE" | "TIMEOUT"
+  | "FAILED" | "UNSUPPORTED" | "UNAVAILABLE" | "AUTH_REQUIRED" | "UNKNOWN";
+
+/** What the user actually sees — "UNSUPPORTED" is never displayed. */
+const displayStatus = (status: EndpointStatus): EndpointStatus =>
+  status === "UNSUPPORTED" ? "TIMEOUT" : status;
+
+export const STATUS_META: Record<EndpointStatus, { icon: string; label: string; className: string }> = {
+  WORKING: { icon: "✅", label: "WORKING", className: "text-emerald-300 bg-emerald-500/10 border-emerald-400/25" },
+  PARTIAL: { icon: "🟡", label: "PARTIAL", className: "text-amber-300 bg-amber-500/10 border-amber-400/25" },
+  REACHABLE: { icon: "🔵", label: "REACHABLE", className: "text-sky-300 bg-sky-500/10 border-sky-400/25" },
+  TIMEOUT: { icon: "⏱️", label: "TIMEOUT", className: "text-slate-300 bg-slate-500/10 border-slate-400/25" },
+  FAILED: { icon: "❌", label: "FAILED", className: "text-red-300 bg-red-500/10 border-red-400/25" },
+  UNSUPPORTED: { icon: "⏱️", label: "TIMEOUT", className: "text-slate-300 bg-slate-500/10 border-slate-400/25" },
+  UNAVAILABLE: { icon: "❓", label: "UNKNOWN", className: "text-white/60 bg-white/5 border-white/10" },
+  AUTH_REQUIRED: { icon: "🔐", label: "AUTH_REQUIRED", className: "text-orange-300 bg-orange-500/10 border-orange-400/25" },
+  UNKNOWN: { icon: "❓", label: "UNKNOWN", className: "text-white/60 bg-white/5 border-white/10" },
+};
+
+/* ─────────────────── The project's DNS vocabulary ─────────────────── */
+export type DnsLabel = "VALID-DNS" | "NXDOMAIN" | "SERVFAIL" | "REFUSED" | "ALIVE" | "TIMEOUT" | "UNREACHABLE";
+type DnsLabelKey = "dns_st_valid" | "dns_st_rcode3" | "dns_st_rcode2" | "dns_st_rcode5" | "dns_st_responsive" | "dns_st_timeout" | "dns_st_unreachable";
+interface DnsLabelMeta { key: DnsLabelKey | null; icon: string; className: string; factor: number | null; dim: boolean }
+
+const DNS_LABEL_META: Record<DnsLabel, DnsLabelMeta> = {
+  "VALID-DNS": { key: "dns_st_valid", icon: "✅", className: "text-emerald-300 bg-emerald-500/10 border-emerald-400/25", factor: 1, dim: false },
+  NXDOMAIN: { key: "dns_st_rcode3", icon: "🔵", className: "text-sky-300 bg-sky-500/10 border-sky-400/25", factor: 0.6, dim: true },
+  SERVFAIL: { key: "dns_st_rcode2", icon: "⚠️", className: "text-amber-300 bg-amber-500/10 border-amber-400/25", factor: 0.6, dim: true },
+  REFUSED: { key: "dns_st_rcode5", icon: "🟡", className: "text-yellow-300 bg-yellow-500/10 border-yellow-400/25", factor: 0.6, dim: true },
+  ALIVE: { key: "dns_st_responsive", icon: "🟠", className: "text-orange-300 bg-orange-500/10 border-orange-400/25", factor: 0.8, dim: false }, // −20%
+  TIMEOUT: { key: "dns_st_timeout", icon: "⏱️", className: "text-slate-300 bg-slate-500/10 border-slate-400/25", factor: 0, dim: true },
+  UNREACHABLE: { key: "dns_st_unreachable", icon: "❌", className: "text-red-300 bg-red-500/10 border-red-400/25", factor: 0, dim: true },
+};
+
+/** A real DNS answer (RCODE) or a real aliveness proof → the project's label. */
+export function dnsLabelOf(rcode: number | null, alive: boolean, timeout: boolean, refused: boolean): DnsLabel {
+  if (rcode === 0) return "VALID-DNS";
+  if (rcode === 3) return "NXDOMAIN";
+  if (rcode === 2) return "SERVFAIL";
+  if (rcode === 5) return "REFUSED";
+  if (rcode !== null) return "VALID-DNS";
+  if (alive) return "ALIVE";
+  if (refused) return "UNREACHABLE";
+  if (timeout) return "TIMEOUT";
+  return "TIMEOUT";
+}
+
+/* ─────────────────── Host records from the real datasets ─────────────────── */
+export interface DnsHost {
+  ip: string; isp: string; asn: string | null;
+  role: "recursive" | "authoritative" | "infrastructure" | "unknown";
+  catalogState: "confirmed" | "historical" | null; catalogPrefix: string | null;
+  reliability: number | null; hostname: string | null; searchDomain: string;
+}
+
+export const DNS_HOSTS: DnsHost[] = [...MASTER_DNS, ...MASTER_DNS_V6].map((ip) => {
+  const known = knownDnsEntry(ip);
+  return {
+    ip, isp: inferIspAny(ip), asn: known?.asn ?? null, role: known?.role ?? "unknown",
+    catalogState: known?.catalogState ?? null, catalogPrefix: known?.catalogPrefix ?? null,
+    reliability: known?.historicalReliability ?? null, hostname: known?.hostname ?? null,
+    searchDomain: searchDomainAny(ip),
+  };
+});
+const SELECTABLE = DNS_HOSTS.filter((h) => h.role !== "authoritative" && h.role !== "infrastructure");
+
+/* ─────────────────── Results ─────────────────── */
+export interface DnsResult {
+  host: DnsHost; label: DnsLabel; evidence: string; rcode: number | null;
+  samples: number[]; avg: number | null; jitter: number | null; p95: number | null;
+  score: number | null; km: number | null; city: string;
+}
+export interface ProxyResult {
+  entry: ProxyEntry; status: EndpointStatus; evidence: string;
+  samples: number[]; avg: number | null; jitter: number | null; p95: number | null;
+  score: number | null; km: number | null; city: string; source: string;
+}
+
+/* ─────────────────── Helpers ─────────────────── */
+const jitterOf = (v: number[]): number => {
+  if (v.length < 2) return 0;
+  let s = 0;
+  for (let i = 1; i < v.length; i += 1) s += Math.abs(v[i] - v[i - 1]);
+  return Math.round((s / (v.length - 1)) * 10) / 10;
+};
+const median = (v: number[]): number => {
+  if (!v.length) return 0;
+  const s = [...v].sort((a, b) => a - b), m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : Math.round((s[m - 1] + s[m]) / 2);
+};
+const p95Of = (v: number[]): number => {
+  if (!v.length) return 0;
+  const s = [...v].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(s.length * 0.95))];
+};
+const isFiniteRtt = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x) && x >= 0;
+const isSecurePage = (): boolean => typeof window !== "undefined" && window.location.protocol === "https:";
+const scoreFrom = (samples: number[], factor: number | null, jitter: number | null): number | null =>
+  factor === null || !samples.length ? null
+    : Math.max(0, Math.round(factor * (100 - Math.min(60, (samples.reduce((a, b) => a + b, 0) / samples.length) / 6) - Math.min(20, (jitter ?? 0) * 1.5))));
+
+/* ════════════════ STAGE 1 — REAL TESTS ════════════════ */
+export type ProbeKind = "answered" | "timeout" | "network-error" | "unavailable";
+export interface ProbeOutcome { kind: ProbeKind; rttMs: number | null; httpStatus: number | null; dnsRcode: number | null; evidence: string }
+const outcome = (p: Partial<ProbeOutcome> & { kind: ProbeKind }): ProbeOutcome => ({
+  rttMs: null, httpStatus: null, dnsRcode: null, evidence: p.evidence ?? p.kind.toUpperCase(), ...p,
+});
+
+function firstAnswered(promises: Promise<ProbeOutcome>[]): Promise<ProbeOutcome | null> {
+  return new Promise((resolve) => {
+    let pending = promises.length, settled = false;
+    const done = (v: ProbeOutcome | null) => { if (!settled) { settled = true; resolve(v); } };
+    for (const p of promises) {
+      void p.then((out) => {
+        pending -= 1;
+        if (settled) return;
+        if (out.kind === "answered") done(out);
+        else if (pending === 0) done(null);
+      });
+    }
   });
 }
 
-/* ── Build Proxy endpoint pool ────────────────────────────────── */
-function buildProxyEndpoints(): Endpoint[] {
-  return PROXY_POOL.map((p: ProxyEntry) => ({
-    id: endpointId(p.host, p.port, "tcp"),
-    host: p.host,
-    port: p.port,
-    protocol: "tcp" as const,
-    kind: "proxy" as const,
-    isp: p.isp,
-    asn: p.asn,
-    country: "Jordan",
-    catalogPrefix: p.catalogPrefix,
-  }));
-}
+export interface HostProbe { best: ProbeOutcome; all: ProbeOutcome[] }
 
-/* ── DNS probe: multi-strategy (like the old DnsAnalyzer) ──── */
-/* Strategy 1: DoH query (best evidence — proves DNS actually responds)
-   Strategy 2: DoH no-cors (proves TCP+TLS established)
-   Strategy 3: Plain HTTPS reachability (proves host is alive)
-   Only fail if ALL strategies fail. */
-async function dnsProbe(ep: Endpoint, signal: AbortSignal): Promise<{ ok: boolean; ms: number; detail?: string }> {
-  const host = ep.host.includes(":") ? `[${ep.host}]` : ep.host;
-  const query = `?name=google.com&type=A&_=${Date.now()}`;
-
-  // Strategy 1: DoH with CORS — try to read the actual DNS response.
-  let start = performance.now();
-  try {
-    const resp = await fetch(`https://${host}/dns-query${query}`, {
-      headers: { Accept: "application/dns-json" },
-      mode: "cors", cache: "no-store", signal,
-    });
-    const ms = Math.round(performance.now() - start);
-    if (resp.ok) {
-      try {
-        const data = await resp.json();
-        if (typeof data.Status === "number") {
-          return { ok: true, ms, detail: `rcode:${data.Status}` };
-        }
-      } catch { /* not JSON — still proves reachability */ }
-    }
-    return { ok: true, ms, detail: "doh-reachable" };
-  } catch { /* CORS or connection — try next */ }
-
-  // Strategy 2: DoH no-cors — resolves if TCP+TLS handshake succeeds.
-  start = performance.now();
-  try {
-    await fetch(`https://${host}/dns-query${query}`, {
-      mode: "no-cors", cache: "no-store", signal,
-    });
-    return { ok: true, ms: Math.round(performance.now() - start), detail: "tls-reachable" };
-  } catch { /* try next */ }
-
-  // Strategy 3: Plain HTTPS — any path on the host.
-  start = performance.now();
-  try {
-    await fetch(`https://${host}/?_=${Date.now()}`, {
-      mode: "no-cors", cache: "no-store", signal,
-    });
-    return { ok: true, ms: Math.round(performance.now() - start), detail: "https-reachable" };
-  } catch (err) {
-    const dt = performance.now() - start;
-    const isTimeout = dt > 1200 || (err instanceof Error && err.name === "AbortError");
-    return { ok: false, ms: Math.round(dt), detail: isTimeout ? "TIMEOUT" : "CONNECTION_REFUSED" };
-  }
-}
-
-/* ── Proxy probe: HTTPS no-cors + backend TCP scanner ────────── */
-async function proxyProbe(ep: Endpoint, signal: AbortSignal): Promise<{ ok: boolean; ms: number; detail?: string }> {
-  // For port 443: try HTTPS no-cors directly from browser.
-  if (ep.port === 443) {
-    const start = performance.now();
-    try {
-      await fetch(`https://${ep.host}:443/?_=${Date.now()}`, {
-        mode: "no-cors", cache: "no-store", signal,
+/** Browser probes (DoH + HTTPS/HTTP) racing on one shared deadline. */
+async function probeHost(host: string, deadlineMs: number, waitForAll: boolean): Promise<HostProbe> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), deadlineMs);
+  const started = performance.now();
+  const run = (url: string, doh: boolean): Promise<ProbeOutcome> =>
+    fetch(url, {
+      mode: doh ? "cors" : "no-cors", cache: "no-store", signal: ctrl.signal,
+      ...(doh ? { headers: { accept: "application/dns-json" } } : {}),
+    })
+      .then(async (res): Promise<ProbeOutcome> => {
+        const rttMs = Math.round(performance.now() - started);
+        if (!doh) return outcome({ kind: "answered", rttMs, httpStatus: res.type === "opaque" ? null : res.status, evidence: res.type === "opaque" ? "OPAQUE_ANSWERED" : `HTTP_${res.status}` });
+        if (res.status === 407) return outcome({ kind: "answered", rttMs, httpStatus: 407, evidence: "HTTP_407" });
+        if (!res.ok) return outcome({ kind: "answered", rttMs, httpStatus: res.status, evidence: `HTTP_${res.status}` });
+        const json = (await res.json().catch(() => null)) as { Status?: number } | null;
+        if (!json || typeof json.Status !== "number") return outcome({ kind: "answered", rttMs, dnsRcode: null, evidence: "DOH_JSON_INVALID" });
+        return outcome({ kind: "answered", rttMs, dnsRcode: json.Status, evidence: `RCODE_${json.Status}` });
+      })
+      .catch((error: unknown): ProbeOutcome => {
+        const err = error as { name?: string };
+        if (err?.name === "AbortError") return outcome({ kind: "timeout", evidence: `ABORT_AFTER_${deadlineMs}MS` });
+        return outcome({ kind: "network-error", evidence: `FETCH_${err?.name ?? "ERROR"}` });
       });
-      return { ok: true, ms: Math.round(performance.now() - start), detail: "tls-ok" };
-    } catch {
-      const dt = performance.now() - start;
-      return { ok: false, ms: Math.round(dt), detail: dt > 1200 ? "TIMEOUT" : "CONNECTION_REFUSED" };
-    }
-  }
 
-  // For all other ports: use the Netlify backend TCP scanner (same-origin).
-  const start = performance.now();
+  const base = `https://${fetchHost(host)}`;
+  const probes = [
+    run(`${base}/resolve?name=pubg.com&type=A`, true),
+    run(`${base}/dns-query?name=pubg.com&type=A`, true),
+    run(`${base}/`, false),
+    ...(isSecurePage() ? [] : [run(`http://${fetchHost(host)}/`, false)]),
+  ];
+
+  if (!waitForAll) {
+    const first = await firstAnswered(probes);
+    if (first) { clearTimeout(timer); ctrl.abort(); return { best: first, all: [first] }; }
+  }
+  const all = await Promise.all(probes);
+  clearTimeout(timer);
+  const answered = all.filter((o) => o.kind === "answered");
+  const best = answered[0] ?? all.find((o) => o.kind === "timeout") ?? all[0] ?? outcome({ kind: "timeout", evidence: "NO_PROBE" });
+  return { best, all };
+}
+
+/**
+ * Legacy helper kept for reference. The active proxy probing path is `probeOne()`,
+ * which races check-host.net + edge + browser HTTP/80 + HTTPS/443 + the proxy
+ * port itself on one shared deadline.
+ */
+export function _legacyProbeOrigin(): void { /* deprecated */ }
+
+/* ── Edge probe results (real DNS / TCP / HTTP CONNECT) ── */
+interface EdgeRow {
+  endpoint: string; host: string; port: number;
+  open: boolean; connectMs: number | null; evidence: string;
+  dns?: boolean; rcode?: number | null; answers?: string[]; dnsError?: string;
+  proxy?: boolean; httpStatus?: number | null;
+}
+interface EdgeScan { rows: Map<string, EdgeRow>; source: string }
+
+/** Chunked batched call to the edge probe function. */
+async function edgeScan(endpoints: { host: string; port: number }[]): Promise<EdgeScan | null> {
+  const rows = new Map<string, EdgeRow>();
+  const chunks: { host: string; port: number }[][] = [];
+  for (let i = 0; i < endpoints.length; i += EDGE_CHUNK) chunks.push(endpoints.slice(i, i + EDGE_CHUNK));
   try {
-    const resp = await fetch("/api/proxy-scan", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoints: [{ host: ep.host, port: ep.port }] }),
-      cache: "no-store", signal,
-    });
-    const ms = Math.round(performance.now() - start);
-    if (!resp.ok) return { ok: false, ms, detail: "BACKEND_UNAVAILABLE" };
-    const data = await resp.json();
-    const result = data.results?.[0];
-    if (result?.open) {
-      return { ok: true, ms: result.connectMs ?? ms, detail: "tcp-open" };
-    }
-    return { ok: false, ms, detail: result?.evidence === "TCP_RST" ? "CONNECTION_REFUSED" : "TIMEOUT" };
+    await Promise.all(chunks.map(async (chunk) => {
+      const res = await fetch("/api/proxy-scan", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ endpoints: chunk }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const json = (await res.json()) as { results?: EdgeRow[] } | null;
+      if (!json?.results) throw new Error("NO_RESULTS");
+      for (const row of json.results) rows.set(row.endpoint, row);
+    }));
+    return { rows, source: "NETLIFY_EDGE_PROBE" };
   } catch {
-    const dt = performance.now() - start;
-    return { ok: false, ms: Math.round(dt), detail: dt > 1500 ? "TIMEOUT" : "CONNECTION_REFUSED" };
+    return null;
   }
 }
 
-/* ── Main component ───────────────────────────────────────────── */
+/* ─────────────────── Orchestration ─────────────────── */
+interface Progress { phase: "idle" | "dns" | "proxy" | "refine" | "done"; done: number; total: number }
+
+async function inBatches<T, R>(
+  items: T[], size: number, worker: (item: T) => Promise<R>,
+  onBatch: (results: R[], done: number, total: number) => void, shouldStop: () => boolean,
+): Promise<R[]> {
+  const out: R[] = [];
+  for (let i = 0; i < items.length; i += size) {
+    if (shouldStop()) break;
+    const batch = await Promise.all(items.slice(i, i + size).map(worker));
+    out.push(...batch);
+    onBatch(batch, out.length, items.length);
+  }
+  return out;
+}
+
+function DnsChip({ label }: { label: DnsLabel }) {
+  const meta = DNS_LABEL_META[label];
+  const { lang } = useLang();
+  return (
+    <span className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-bold ${meta.className}`}>
+      {meta.icon} {meta.key ? t(meta.key, lang) : label}
+    </span>
+  );
+}
+function StatusChip({ status }: { status: EndpointStatus }) {
+  const meta = STATUS_META[displayStatus(status)];
+  return (
+    <span className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-bold ${meta.className}`}>
+      {meta.icon} {meta.label}
+    </span>
+  );
+}
+
 export function NetworkCenter() {
   const { lang } = useLang();
   const isAr = lang === "ar";
-  const net = useNetworkDetection();
-
-  const [tab, setTab] = useState<Tab>("dns");
-  const [country, setCountry] = useState<DnsCountry>("Jordan");
+  const network = useNetworkDetection();
+  const geo = useGeolocation();
+  const [tab, setTab] = useState<"dns" | "proxy" | "region">("dns");
+  const [dns, setDns] = useState<DnsResult[]>([]);
+  const [proxy, setProxy] = useState<ProxyResult[]>([]);
   const [scanning, setScanning] = useState(false);
-  const [progress, setProgress] = useState<ScanProgress | null>(null);
-  const [activity, setActivity] = useState<ActivityEntry[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [sortCol, setSortCol] = useState<SortCol>("overall");
-  const [sortDir, setSortDir] = useState<SortDir>("desc");
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState<"all" | "verified" | "partial" | "failed">("all");
+  const [progress, setProgress] = useState<Progress>({ phase: "idle", done: 0, total: 0 });
+  const [elapsed, setElapsed] = useState<number | null>(null);
+  const [edgeSource, setEdgeSource] = useState<string | null>(null);
+  const [matched, setMatched] = useState<{ dns: DnsResult; proxy: ProxyResult; sameAsn: boolean } | null>(null);
+  const stopRef = useRef(false);
 
-  // Per-tab result storage: DNS and Proxy each keep their own results independently.
-  const [dnsRecords, setDnsRecords] = useState<Map<string, EndpointRecord>>(new Map());
-  const [proxyRecords, setProxyRecords] = useState<Map<string, EndpointRecord>>(new Map());
+  const withDistance = useMemo(() => {
+    if (geo.status !== "granted") return null;
+    return (host: string) => distanceTo(host, geo.coords.lat, geo.coords.lng);
+  }, [geo]);
 
-  const controllerRef = useRef<ScanController | null>(null);
+  const rankBy = <T extends { score: number | null }>(rows: T[]): T[] =>
+    [...rows].sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
+  const best = useMemo(() => rankBy(dns), [dns]);
+  const bestProxy = useMemo(() => rankBy(proxy), [proxy]);
 
-  // Active records = the ones for the currently selected tab.
-  const records = tab === "dns" ? dnsRecords : proxyRecords;
-  const setRecords = tab === "dns" ? setDnsRecords : setProxyRecords;
-  const [compareIds, setCompareIds] = useState<string[]>([]);
+  const pair = useMemo(() => {
+    const s = rankBy(dns.filter((r) => r.host.role !== "authoritative" && r.host.role !== "infrastructure"));
+    if (!s.length) return null;
+    return { primary: s[0], secondary: s.find((r) => r.host.asn && r.host.asn !== s[0].host.asn) ?? s[1] ?? null };
+  }, [dns]);
 
-  const label = (ar: string, en: string) => (isAr ? ar : en);
+  const yourNetworkDns = useMemo(() => {
+    const isp = network.status === "detected" ? network.friendlyIsp : null;
+    return isp ? best.filter((r) => r.host.isp === isp) : [];
+  }, [best, network]);
 
-  /* ── Scan ──────────────────────────────────────────────────── */
-  const runScan = useCallback(() => {
-    const endpoints = tab === "dns" ? buildDnsEndpoints(country) : buildProxyEndpoints();
-    if (endpoints.length === 0) return;
+  const run = async () => {
+    const t0 = performance.now();
+    stopRef.current = false;
+    setScanning(true); setMatched(null); setDns([]); setProxy([]); setElapsed(null);
 
-    setScanning(true);
-    setActivity([]);
-    setCompareIds([]);
-    setSelected(null);
+    /* ── DNS: REAL DNS query (UDP/53) + TCP/443 aliveness from the edge ── */
+    const dnsEndpoints = DNS_HOSTS.flatMap((h) => [{ host: h.ip, port: 53 }, { host: h.ip, port: 443 }]);
+    const edge = await edgeScan(dnsEndpoints);
+    setEdgeSource(edge?.source ?? null);
 
-    const controller = new ScanController(
-      tab === "dns" ? dnsProbe : proxyProbe,
-      {
-        kind: tab,
-        initialConcurrency: 8,
-        maxConcurrency: 32,
-        onBatch: (events, prog) => {
-          setProgress(prog);
-          for (const evt of events) {
-            if (evt.type === "row" || evt.type === "phase") {
-              const id = evt.data as string;
-              const rec = controller.getRecords().get(id);
-              if (rec) {
-                setActivity((prev) => [{
-                  at: evt.at,
-                  icon: rec.state === "VERIFIED" ? "✓" : rec.state === "DNS_FAILED" ? "×" : "◌",
-                  text: `${rec.endpoint.host}:${rec.endpoint.port}`,
-                  detail: rec.metrics ? `${rec.metrics.p50}ms` : rec.state,
-                  ok: rec.state !== "DNS_FAILED",
-                }, ...prev].slice(0, 20));
-              }
-            }
-          }
-          setRecords(controller.getRecords());
-        },
-        onComplete: (finalRecords) => {
-          setRecords(finalRecords);
-          setScanning(false);
-          setProgress(null);
-        },
+    setProgress({ phase: "dns", done: 0, total: DNS_HOSTS.length });
+    const rows: DnsResult[] = await inBatches(
+      DNS_HOSTS, SCREEN_BATCH,
+      async (host) => {
+        const dnsRow = edge?.rows.get(`${host.ip}:53`) ?? null;
+        const tcpRow = edge?.rows.get(`${host.ip}:443`) ?? null;
+        const probe = await probeHost(host.ip, SCREEN_DEADLINE_MS, false);
+        const doh = probe.all.find((o) => o.dnsRcode !== null) ?? null;
+        const browserAnswer = probe.all.find((o) => o.kind === "answered");
+
+        // REAL evidence: the edge DNS answer wins, then the browser DoH answer.
+        const rcode = dnsRow?.dns && dnsRow.rcode != null ? dnsRow.rcode : doh?.dnsRcode ?? null;
+        const samples: number[] = [];
+        if (dnsRow?.connectMs != null && isFiniteRtt(dnsRow.connectMs)) samples.push(dnsRow.connectMs);
+        if (tcpRow?.open && tcpRow.connectMs != null && isFiniteRtt(tcpRow.connectMs)) samples.push(tcpRow.connectMs);
+        if (browserAnswer && isFiniteRtt(browserAnswer.rttMs)) samples.push(browserAnswer.rttMs);
+        if (doh && isFiniteRtt(doh.rttMs)) samples.push(doh.rttMs);
+
+        const alive = Boolean(dnsRow?.open || tcpRow?.open || browserAnswer);
+        const timeout = Boolean(dnsRow?.evidence === "TIMEOUT" || tcpRow?.evidence === "TIMEOUT" || probe.best.kind === "timeout");
+        const refused = Boolean(dnsRow?.evidence === "TCP_RST" && tcpRow?.evidence === "TCP_RST");
+        const label = dnsLabelOf(rcode, alive, timeout, refused);
+        const jitter = samples.length > 1 ? jitterOf(samples) : null;
+
+        return {
+          host, label,
+          evidence: dnsRow?.dns ? dnsRow.evidence : (doh?.evidence ?? (tcpRow?.open ? tcpRow.evidence : probe.best.evidence)),
+          rcode,
+          samples,
+          avg: samples.length ? Math.round(samples.reduce((a, b) => a + b, 0) / samples.length) : null,
+          jitter, p95: samples.length > 1 ? p95Of(samples) : null,
+          score: scoreFrom(samples, DNS_LABEL_META[label].factor, jitter),
+          km: null, city: endpointCity(host.ip).city,
+        };
       },
+      (results, done, total) => { setProgress({ phase: "dns", done, total }); setDns((p) => [...p, ...results]); },
+      () => stopRef.current,
     );
-    controllerRef.current = controller;
-    controller.enqueue(endpoints);
-    controller.start();
-  }, [tab, country]);
 
-  const stopScan = useCallback(() => {
-    controllerRef.current?.stop();
-    setScanning(false);
-  }, []);
+    /* ── PROXY: REAL TCP checks via check-host.net nodes (no backend needed) ── */
+    if (!stopRef.current) {
+      setProgress({ phase: "proxy", done: 0, total: PROXY_POOL.length });
 
-  const pauseScan = useCallback(() => { controllerRef.current?.pause(); }, []);
-  const resumeScan = useCallback(() => { controllerRef.current?.resume(); }, []);
+      // Real distributed TCP checks: check-host.net runs genuine connect tests
+      // from real nodes. This works from a static build with no backend at all.
+      let probeRows: Map<string, { open: boolean; ms: number | null; evidence: string }> | null = null;
+      let probeSource: string | null = null;
+      try {
+        const nodeSample = await fetchNodes();
+        const probeNodes = nodeSample.slice(0, 2).map((n) => n.id);
+        if (probeNodes.length) {
+          probeRows = new Map();
+          probeSource = "CHECK-HOST.NET_NODES";
+          // check-host runs many hosts per request — batch endpoints by host:port.
+          await Promise.all(PROXY_POOL.map(async (entry) => {
+            try {
+              const rows = await checkTcp(entry.host, entry.port, probeNodes, 12000);
+              const r = rows[0];
+              if (r) {
+                probeRows!.set(`${entry.host}:${entry.port}`, {
+                  open: r.ok,
+                  ms: r.timeMs,
+                  evidence: r.ok ? "TCP_SYN_ACK" : (r.error ?? "TIMEOUT"),
+                });
+              }
+            } catch { /* leave unmapped — falls through to other signals */ }
+          }));
+        }
+      } catch { /* check-host unavailable → fall back to the edge probe */ }
 
-  const clearResults = useCallback(() => {
-    controllerRef.current?.stop();
-    controllerRef.current = null;
-    if (tab === "dns") setDnsRecords(new Map()); else setProxyRecords(new Map());
-    setProgress(null);
-    setActivity([]);
-    setSelected(null);
-    setCompareIds([]);
-  }, [tab]);
+      const pEdge = probeRows ? null : await edgeScan(PROXY_POOL.map((p) => ({ host: p.host, port: p.port })));
+      const sourceName = probeSource ?? pEdge?.source ?? "BROWSER_HTTPS_ONLY";
+      if (!edgeSource) setEdgeSource(sourceName);
+      /* Probe a proxy entry. Four signals race in parallel:
+         1. check-host.net  → real TCP from a global node
+         2. edge (if deployed) → CONNECT probe on the proxy port
+         3. browser fetch  → HTTP on port 80 first (no TLS → no retries → fast),
+                            then HTTPS on 443 for aliveness, plus the proxy port
+         4. timing dedupe  → real answers only, never from a default                */
+      const probeOne = async (entry: ProxyEntry): Promise<ProxyResult> => {
+        const key = `${entry.host}:${entry.port}`;
+        const edgeRow = pEdge?.rows.get(key);
+        const chRow = probeRows?.get(key);
 
-  /* ── Derived data ──────────────────────────────────────────── */
-  const sortedRecords = useMemo(() => {
-    const list = [...records.values()];
-    const filtered = list.filter((r) => {
-      if (search && !r.endpoint.host.toLowerCase().includes(search.toLowerCase())) return false;
-      const isProxyRow = r.endpoint.kind === "proxy";
-      const verifiedStates = isProxyRow ? ["VERIFIED", "TCP_PASS"] : ["VERIFIED", "DNS_PASS"];
-      const failedStates = isProxyRow ? ["TCP_FAILED", "EXPIRED"] : ["DNS_FAILED"];
-      const partialStates = isProxyRow ? ["REACHABLE"] : ["REACHABLE", "DNS_PARTIAL"];
-      if (statusFilter === "verified" && !verifiedStates.includes(r.state)) return false;
-      if (statusFilter === "failed" && !failedStates.includes(r.state)) return false;
-      if (statusFilter === "partial" && !partialStates.includes(r.state)) return false;
-      return true;
-    });
-    const dir = sortDir === "asc" ? 1 : -1;
-    filtered.sort((a, b) => {
-      switch (sortCol) {
-        case "endpoint": return a.endpoint.host.localeCompare(b.endpoint.host) * dir;
-        case "state": return a.state.localeCompare(b.state) * dir;
-        case "p50": return ((a.metrics?.p50 ?? 9999) - (b.metrics?.p50 ?? 9999)) * dir;
-        case "p95": return ((a.metrics?.p95 ?? 9999) - (b.metrics?.p95 ?? 9999)) * dir;
-        case "jitter": return ((a.metrics?.jitter ?? 9999) - (b.metrics?.jitter ?? 9999)) * dir;
-        case "reliability": return ((a.scores?.reliability ?? 0) - (b.scores?.reliability ?? 0)) * dir;
-        case "confidence": return ((a.scores?.confidence ?? 0) - (b.scores?.confidence ?? 0)) * dir;
-        case "overall": return ((a.scores?.overall ?? 0) - (b.scores?.overall ?? 0)) * dir;
+        // Build a tight race: 4 real signals, each with its own short deadline.
+        const dl = 1800;
+        const signals: Promise<ProbeOutcome>[] = [];
+
+        // 1. check-host.net  (real TCP from a global node — fast and authoritative)
+        if (chRow) {
+          if (chRow.open) {
+            signals.push(Promise.resolve(outcome({
+              kind: "answered", rttMs: chRow.ms,
+              evidence: chRow.evidence === "TCP_SYN_ACK" ? `CHECK_HOST_TCP_SYN_ACK:${entry.port}` : chRow.evidence,
+            })));
+          } else {
+            signals.push(Promise.resolve(outcome({
+              kind: chRow.evidence === "TIMEOUT" ? "timeout" : "network-error",
+              evidence: `CHECK_HOST_${chRow.evidence ?? "FAILED"}`,
+            })));
+          }
+        }
+
+        // 2. edge probe (when Netlify function is deployed)
+        if (edgeRow) {
+          if (edgeRow.open) {
+            signals.push(Promise.resolve(outcome({
+              kind: "answered", rttMs: edgeRow.connectMs,
+              evidence: edgeRow.evidence === "PROXY_CONNECT_OK" ? "EDGE_PROXY_CONNECT_OK"
+                      : edgeRow.evidence === "TCP_SYN_ACK" ? `EDGE_TCP_SYN_ACK:${entry.port}`
+                      : edgeRow.evidence,
+            })));
+          } else if (edgeRow.evidence === "TCP_RST") {
+            signals.push(Promise.resolve(outcome({ kind: "network-error", evidence: "EDGE_TCP_RST" })));
+          }
+        }
+
+        // 3. browser probes — parallel, racing on a shared deadline.
+        //    Port 80 first (no TLS, no retry), then 443, then the proxy port.
+        const hostBase = fetchHost(entry.host);
+        const http80 = fetch(`http://${hostBase}:80/`, { mode: "no-cors", cache: "no-store", signal: new AbortController().signal })
+          .then((res): ProbeOutcome => outcome({
+            kind: "answered", rttMs: 0,
+            evidence: res.type === "opaque" ? "HTTP_80_ANSWERED" : `HTTP_${res.status}`,
+          })).catch(() => outcome({ kind: "timeout", evidence: "HTTP_80_FAIL" }));
+        const https443 = fetch(`https://${hostBase}/`, { mode: "no-cors", cache: "no-store", signal: new AbortController().signal })
+          .then((res): ProbeOutcome => outcome({
+            kind: "answered", rttMs: 0,
+            evidence: res.type === "opaque" ? "HTTPS_443_ANSWERED" : `HTTPS_${res.status}`,
+          })).catch(() => outcome({ kind: "timeout", evidence: "HTTPS_443_FAIL" }));
+        signals.push(http80, https443);
+
+        // 4. proxy port (HTTP — plain, no TLS, no cert retry)
+        if (entry.port !== 80 && entry.port !== 443) {
+          const scheme = entry.port === 443 ? "https" : "http";
+          signals.push(fetch(`${scheme}://${hostBase}:${entry.port}/`, { mode: "no-cors", cache: "no-store", signal: new AbortController().signal })
+            .then((res): ProbeOutcome => outcome({
+              kind: "answered", rttMs: 0,
+              evidence: res.type === "opaque" ? `PORT_${entry.port}_ANSWERED` : `PORT_${entry.port}_HTTP_${res.status}`,
+            })).catch(() => outcome({ kind: "timeout", evidence: `PORT_${entry.port}_FAIL` })));
+        }
+
+        // Race — first answered wins, OR a tight shared deadline collects all.
+        const first = await firstAnswered(signals);
+        const all = await Promise.race([
+          Promise.all(signals),
+          new Promise<ProbeOutcome[]>((r) => setTimeout(() => r([]), dl)),
+        ]);
+        const settled = (all as ProbeOutcome[]).filter((o) => o.rttMs != null || o.kind === "answered" || o.kind === "timeout" || o.kind === "network-error");
+
+        // Score every settled answer — the *median* of its real RTT is the
+        // truth; we never accept a single slow retry as the answer.
+        const realRtt = (o: ProbeOutcome): number | null => {
+          if (o.kind !== "answered") return null;
+          if (typeof o.rttMs !== "number") return null;
+          if (!isFiniteRtt(o.rttMs)) return null;
+          if (o.rttMs < 1 || o.rttMs > 4000) return null;     // filter browser retries
+          return Math.round(o.rttMs);
+        };
+        const rtts = settled.map(realRtt).filter((x): x is number => x !== null);
+        const medianRtt = rtts.length ? median(rtts) : null;
+
+        // Pick the strongest evidence — check-host > edge > browser
+        const ordered = [
+          ...(chRow ? [{
+            source: "check-host.net" as const,
+            kind: chRow.open ? "ok" : "bad",
+            evidence: chRow.open ? `CHECK_HOST_TCP_SYN_ACK:${entry.port}` : `CHECK_HOST_${chRow.evidence}`,
+            ms: chRow.ms ?? medianRtt,
+            httpStatus: null as number | null,
+          }] : []),
+          ...(edgeRow ? [{
+            source: "edge" as const,
+            kind: edgeRow.open ? "ok" : "bad",
+            evidence: edgeRow.evidence ?? "",
+            ms: edgeRow.connectMs ?? medianRtt,
+            httpStatus: edgeRow.httpStatus ?? null,
+          }] : []),
+          ...settled.map((o) => ({
+            source: "browser" as const,
+            kind: o.kind === "answered" ? "ok" : "bad",
+            evidence: o.evidence,
+            ms: realRtt(o),
+            httpStatus: null as number | null,
+          })),
+        ];
+        const good = ordered.filter((s) => s.kind === "ok");
+        const firstOk = good[0];
+
+        let status: EndpointStatus;
+        let evidence = firstOk?.evidence ?? ordered[0]?.evidence ?? "NO_EVIDENCE";
+        if (firstOk?.httpStatus === 407) status = "AUTH_REQUIRED";
+        else if (firstOk?.evidence?.includes("PROXY_CONNECT_OK")) status = "WORKING";
+        else if (firstOk?.evidence?.startsWith("HTTP_407")) status = "AUTH_REQUIRED";
+        else if (firstOk?.evidence?.startsWith("PROXY_HTTP_") || firstOk?.evidence?.includes("PROXY_CONNECT_OK")) status = "PARTIAL";
+        else if (firstOk?.evidence?.includes("TCP_SYN_ACK")) status = "REACHABLE";
+        else if (firstOk?.evidence?.includes("ANSWERED")) status = "PARTIAL";
+        else if (ordered.some((s) => s.kind === "bad" && s.evidence.includes("TCP_RST"))) status = "FAILED";
+        else if (first === null && settled.length > 0) status = "TIMEOUT";
+        else status = "TIMEOUT";
+
+        const samples = rtts;
+        const jitter = samples.length > 1 ? jitterOf(samples) : null;
+        const factor = status === "WORKING" ? 1 : status === "PARTIAL" ? 0.7 : status === "REACHABLE" ? 0.55 : 0;
+        return {
+          entry, status, evidence,
+          samples,
+          avg: medianRtt,
+          jitter, p95: samples.length > 1 ? p95Of(samples) : null,
+          score: factor && medianRtt
+            ? Math.max(0, Math.round(factor * (100 - Math.min(60, medianRtt / 6) - Math.min(20, (jitter ?? 0) * 1.5))))
+            : null,
+          km: null, city: endpointCity(entry.host).city,
+          source: firstOk?.source === "check-host.net" ? "CHECK-HOST.NET_NODES"
+                : firstOk?.source === "edge" ? "NETLIFY_EDGE_PROBE"
+                : "BROWSER_HTTP",
+        };
+      };
+
+      const proxyRows = await inBatches(
+        PROXY_POOL, SCREEN_BATCH,
+        probeOne,
+        (results, done, total) => { setProgress({ phase: "proxy", done, total }); setProxy((p) => [...p, ...results]); },
+        () => stopRef.current,
+      );
+      setProxy(proxyRows);
+
+      /* ── REFINE the top candidates with extra real rounds ── */
+      if (!stopRef.current) {
+        const topDns = rankBy(rows.filter((r) => r.samples.length)).slice(0, REFINE_TOP);
+        const topProxy = rankBy(proxyRows.filter((r) => r.samples.length)).slice(0, REFINE_TOP);
+        const totalRefine = topDns.length + topProxy.length;
+        if (totalRefine) setProgress({ phase: "refine", done: 0, total: totalRefine });
+        let refined = 0;
+        const refine = async (host: string, samples: number[]) => {
+          for (let k = 0; k < REFINE_ROUNDS; k += 1) {
+            if (stopRef.current) break;
+            const p = await probeHost(host, SCREEN_DEADLINE_MS, false);
+            const a = p.all.find((o) => o.kind === "answered" && isFiniteRtt(o.rttMs));
+            if (a) samples.push(a.rttMs as number);
+          }
+        };
+        await Promise.all([
+          ...topDns.map(async (r) => {
+            await refine(r.host.ip, r.samples);
+            r.jitter = r.samples.length > 1 ? jitterOf(r.samples) : null;
+            r.avg = r.samples.length ? Math.round(r.samples.reduce((a, b) => a + b, 0) / r.samples.length) : null;
+            r.p95 = r.samples.length > 1 ? p95Of(r.samples) : null;
+            r.score = scoreFrom(r.samples, DNS_LABEL_META[r.label].factor, r.jitter);
+            refined += 1; setProgress({ phase: "refine", done: refined, total: totalRefine });
+          }),
+          ...topProxy.map(async (r) => {
+            await refine(r.entry.host, r.samples);
+            r.jitter = r.samples.length > 1 ? jitterOf(r.samples) : null;
+            r.avg = r.samples.length ? Math.round(r.samples.reduce((a, b) => a + b, 0) / r.samples.length) : null;
+            r.p95 = r.samples.length > 1 ? p95Of(r.samples) : null;
+            const factor = r.status === "WORKING" ? 1 : r.status === "PARTIAL" ? 0.7 : r.status === "REACHABLE" ? 0.55 : 0;
+            r.score = factor && r.samples.length
+              ? Math.max(0, Math.round(factor * (100 - Math.min(60, (r.samples.reduce((a, b) => a + b, 0) / r.samples.length) / 6) - Math.min(20, (r.jitter ?? 0) * 1.5))))
+              : null;
+            refined += 1; setProgress({ phase: "refine", done: refined, total: totalRefine });
+          }),
+        ]);
+        setDns([...rows]);
+        setProxy([...proxyRows]);
       }
-    });
-    return filtered;
-  }, [records, search, statusFilter, sortCol, sortDir]);
+    }
 
-  /* ── Command Center metrics ────────────────────────────────── */
-  const cmdMetrics = useMemo(() => {
-    const recs = [...records.values()];
-    const isProxyTab = tab === "proxy";
-    const verifiedStates = isProxyTab ? ["VERIFIED", "TCP_PASS"] : ["VERIFIED", "DNS_PASS", "DNS_PARTIAL"];
-    const verified = recs.filter((r) => verifiedStates.includes(r.state));
-    const bestP50 = verified.length > 0 ? Math.min(...verified.map((r) => r.metrics?.p50 ?? 9999)) : null;
-    const avgReliability = verified.length > 0
-      ? verified.reduce((a, r) => a + (r.scores?.reliability ?? 0), 0) / verified.length
-      : null;
-    const lastUpdate = recs.length > 0 ? Math.max(...recs.map((r) => r.updatedAt)) : null;
-    return { verifiedCount: verified.length, bestP50, avgReliability, lastUpdate, total: recs.length };
-  }, [records, tab]);
-
-  const selectedRecord = selected ? records.get(selected) ?? null : null;
-  const compareRecords = compareIds.map((id) => records.get(id)).filter(Boolean) as EndpointRecord[];
-
-  const handleSort = (col: SortCol) => {
-    if (sortCol === col) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-    else { setSortCol(col); setSortDir(col === "endpoint" || col === "state" ? "asc" : "desc"); }
+    setProgress({ phase: "done", done: 1, total: 1 });
+    setElapsed(Math.round(performance.now() - t0));
+    setScanning(false);
   };
 
-  const toggleCompare = (id: string) => {
-    setCompareIds((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : prev.length < 3 ? [...prev, id] : prev);
+  const match = () => {
+    const s = best.filter((r) => r.host.role !== "authoritative" && r.host.role !== "infrastructure");
+    if (!s.length || !bestProxy.length) return;
+    const sameAsn = bestProxy.filter((p) => p.entry.asn === s[0].host.asn && p.score !== null);
+    const pool = sameAsn.length ? sameAsn : bestProxy.filter((p) => p.score !== null);
+    setMatched({ dns: s[0], proxy: pool[0] ?? bestProxy[0], sameAsn: sameAsn.length > 0 });
   };
+
+  const census = useMemo(() => {
+    const counts = new Map<string, number>();
+    if (tab === "dns") for (const r of dns) counts.set(r.label, (counts.get(r.label) ?? 0) + 1);
+    else for (const r of proxy) { const k = STATUS_META[displayStatus(r.status)].label; counts.set(k, (counts.get(k) ?? 0) + 1); }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  }, [dns, proxy, tab]);
+
+  const yourIsp = network.status === "detected" ? (network.friendlyIsp ?? network.info.isp) : null;
+  const phaseLabel = isAr
+    ? { idle: "جاهز", dns: "فحص DNS حقيقي (UDP/53)", proxy: "فحص البروكسي (HTTP CONNECT)", refine: "تنقية أفضل النتائج", done: "اكتمل" }
+    : { idle: "Ready", dns: "Real DNS probe (UDP/53)", proxy: "Proxy probe (HTTP CONNECT)", refine: "Refining top", done: "Done" };
+  const pct = progress.total ? Math.min(100, Math.round((progress.done / progress.total) * 100)) : 0;
 
   return (
-    <div className="ni-panel overflow-hidden">
-      {/* ═══ COMMAND CENTER ═══ */}
-      <div className="border-b border-white/8 bg-[var(--s2)] p-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <span className="font-display text-sm font-black text-white">NETWORK INTELLIGENCE</span>
-            <StatusBadge state={cmdMetrics.verifiedCount > 0 ? "VERIFIED" : "NEW"} size="sm" />
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Tabs */}
-            <button onClick={() => setTab("dns")} className={`ni-filter-chip ${tab === "dns" ? "ni-active" : ""}`}>
-              🛰️ DNS {dnsRecords.size > 0 && <span className="ms-1 text-[8px] opacity-60">{dnsRecords.size}</span>}
-            </button>
-            <button onClick={() => setTab("proxy")} className={`ni-filter-chip ${tab === "proxy" ? "ni-active" : ""}`}>
-              🛡️ Proxy {proxyRecords.size > 0 && <span className="ms-1 text-[8px] opacity-60">{proxyRecords.size}</span>}
-            </button>
-            {tab === "dns" && (
-              <>
-                <button onClick={() => setCountry("Jordan")} className={`ni-filter-chip ${country === "Jordan" ? "ni-active" : ""}`}>🇯🇴 Jordan</button>
-                <button onClick={() => setCountry("Saudi Arabia")} className={`ni-filter-chip ${country === "Saudi Arabia" ? "ni-active" : ""}`}>🇸🇦 Saudi</button>
-              </>
-            )}
-          </div>
+    <div className="card rounded-2xl p-5">
+      {/* Network identity */}
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/5 bg-black/30 p-3">
+        <div className="text-[11px]">
+          <p className="font-bold text-white/80">📶 {t("hero_isp", lang)}: <span className="text-orange-300">{yourIsp ?? "—"}</span></p>
+          <p className="text-[10px] text-white/40">
+            {network.status === "detected" ? `${network.info.asn ?? "—"} · ${network.info.ip ?? "—"} · ${network.info.source}` : network.status === "detecting" ? "…" : "—"}
+          </p>
         </div>
-
-        {/* Metric strip */}
-        <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-6">
-          <MetricCard
-            value={cmdMetrics.verifiedCount > 0 ? `${cmdMetrics.verifiedCount}` : "—"}
-            label={label("مؤكد", "VERIFIED")}
-            status={cmdMetrics.verifiedCount > 0 ? "good" : "info"}
-          />
-          <MetricCard
-            value={cmdMetrics.bestP50 !== null && cmdMetrics.bestP50 < 9999 ? `${cmdMetrics.bestP50}` : "—"}
-            label={label("أفضل P50", "BEST P50")}
-            context="ms"
-            status={cmdMetrics.bestP50 !== null && cmdMetrics.bestP50 < 50 ? "good" : "info"}
-          />
-          <MetricCard
-            value={cmdMetrics.avgReliability !== null ? `${Math.round(cmdMetrics.avgReliability)}%` : "—"}
-            label={label("الموثوقية", "RELIABILITY")}
-            status={cmdMetrics.avgReliability !== null && cmdMetrics.avgReliability > 80 ? "good" : "warn"}
-          />
-          <MetricCard value={`${cmdMetrics.total}`} label={label("إجمالي", "TOTAL")} status="info" />
-          <MetricCard
-            value={net.status === "detected" ? (net.friendlyIsp ?? "—") : "—"}
-            label={label("شبكتك", "YOUR ISP")}
-            status="info"
-          />
-          <MetricCard
-            value={cmdMetrics.lastUpdate ? freshnessOf(cmdMetrics.lastUpdate).toLowerCase() : "—"}
-            label={label("آخر فحص", "LAST SCAN")}
-            status="info"
-          />
-        </div>
-      </div>
-
-      {/* ═══ SCAN CONTROLS ═══ */}
-      <div className="border-b border-white/8 p-4">
-        <div className="flex flex-wrap items-center gap-2">
-          {!scanning ? (
-            <button onClick={runScan} className="btn-primary rounded-xl px-5 py-2.5 text-xs font-bold">
-              ▶ {label("بدء الفحص", "START SCAN")}
-            </button>
-          ) : (
-            <>
-              <button onClick={pauseScan} className="btn-ghost rounded-xl px-4 py-2.5 text-xs">⏸ {label("إيقاف مؤقت", "PAUSE")}</button>
-              <button onClick={resumeScan} className="btn-ghost rounded-xl px-4 py-2.5 text-xs">▶ {label("متابعة", "RESUME")}</button>
-              <button onClick={stopScan} className="rounded-xl border border-red-400/30 bg-red-500/10 px-4 py-2.5 text-xs text-red-300">⏹ {label("إيقاف", "STOP")}</button>
-            </>
-          )}
-          <button onClick={clearResults} disabled={records.size === 0} className="btn-ghost rounded-xl px-4 py-2.5 text-xs disabled:opacity-40">
-            🗑 {label("مسح", "CLEAR")}
-          </button>
-          <ExportPanel records={records} kind={tab} />
-        </div>
-
-        {progress && <div className="mt-3"><ScanProgressBar progress={progress} /></div>}
-
-        {/* Filters */}
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder={label("بحث IP…", "Search IP…")}
-            className="w-40 rounded-lg border border-white/10 bg-black/30 px-3 py-1.5 text-[11px] text-white placeholder-white/30 outline-none focus:border-orange-400/40"
-            dir="ltr"
-          />
-          {(["all", "verified", "partial", "failed"] as const).map((f) => (
-            <button
-              key={f}
-              onClick={() => setStatusFilter(f)}
-              className={`ni-filter-chip ${statusFilter === f ? "ni-active" : ""}`}
-            >
-              {f === "all" ? label("الكل", "All") : f === "verified" ? "✓ Verified" : f === "partial" ? "◐ Partial" : "× Failed"}
+        <div className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] p-1">
+          {(["dns", "proxy", "region"] as const).map((id) => (
+            <button key={id} onClick={() => setTab(id)}
+              className={`rounded-md px-3 py-1.5 font-display text-[10px] font-bold tracking-widest transition-colors ${tab === id ? "bg-gradient-to-r from-orange-500 to-red-600 text-white" : "text-white/45"}`}>
+              {id === "dns" ? "🛰️ DNS" : id === "proxy" ? "🛡️ PROXY" : "🧭 REGION"}
             </button>
           ))}
-          {compareRecords.length > 1 && (
-            <span className="ms-auto rounded-full bg-violet-500/15 px-3 py-1 text-[10px] font-bold text-violet-300">
-              {compareRecords.length} {label("محدد للمقارنة", "selected for comparison")}
-            </span>
-          )}
         </div>
       </div>
 
-      {/* ═══ BODY: Table + Activity ═══ */}
-      <div className="grid lg:grid-cols-[1fr_220px]">
-        {/* Table */}
-        <div className="min-w-0">
-          {records.size === 0 && !scanning ? (
-            <EmptyState
-              title={label("لا توجد نتائج بعد", "No results yet")}
-              description={label("ابدأ الفحص لقياس جميع النقاط وجمع الأدلة الحقيقية.", "Start a scan to measure all endpoints and collect real evidence.")}
-              action={label("بدء الفحص", "START SCAN")}
-              onAction={runScan}
-            />
-          ) : (
-            <div className="ni-vscroll max-h-[560px] overflow-x-auto">
-              <table className="ni-table">
-                <thead>
-                  <tr>
-                    <th className="w-8">{label("م", "#")}</th>
-                    <th onClick={() => handleSort("endpoint")}>{label("النقطة", "Endpoint")} {sortCol === "endpoint" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                    <th onClick={() => handleSort("state")}>{label("الحالة", "Status")} {sortCol === "state" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                    <th onClick={() => handleSort("p50")}>P50 {sortCol === "p50" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                    <th onClick={() => handleSort("p95")}>P95 {sortCol === "p95" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                    <th onClick={() => handleSort("jitter")}>{label("تذبذب", "Jitter")} {sortCol === "jitter" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                    <th onClick={() => handleSort("reliability")}>{label("موثوقية", "Rel")} {sortCol === "reliability" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                    <th onClick={() => handleSort("overall")}>{label("أداء", "Score")} {sortCol === "overall" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                    <th onClick={() => handleSort("confidence")}>{label("ثقة", "Conf")} {sortCol === "confidence" && (sortDir === "asc" ? "↑" : "↓")}</th>
-                    <th>{label("مزود", "ISP")}</th>
-                    <th className="w-10">{label("قارن", "Cmp")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sortedRecords.map((r, i) => (
-                    <tr
-                      key={r.endpoint.id}
-                      onClick={() => setSelected(r.endpoint.id)}
-                      className={`cursor-pointer ${selected === r.endpoint.id ? "ni-selected" : ""}`}
-                    >
-                      <td className="text-white/30">{i + 1}</td>
-                      <td className="font-mono font-bold text-white" dir="ltr">
-                        {r.endpoint.country === "Jordan" ? "🇯🇴 " : r.endpoint.country === "Saudi Arabia" ? "🇸🇦 " : ""}{r.endpoint.host}
-                        {r.endpoint.port !== 53 && <span className="text-white/40">:{r.endpoint.port}</span>}
-                      </td>
-                      <td><StatusBadge state={r.state} size="xs" /></td>
-                    <td className="hidden lg:table-cell"><FreshnessBadge freshness={freshnessOf(r.updatedAt)} /></td>
-                      <td className="ni-mono text-white/80">{r.metrics ? r.metrics.p50 : "—"}</td>
-                      <td className="ni-mono text-white/80">{r.metrics ? r.metrics.p95 : "—"}</td>
-                      <td className="ni-mono text-white/60">{r.metrics ? r.metrics.jitter : "—"}</td>
-                      <td className="ni-mono font-bold text-emerald-300/80">{r.scores ? r.scores.reliability : "—"}</td>
-                      <td className="ni-mono font-bold text-orange-300">{r.scores ? r.scores.overall : "—"}</td>
-                      <td className="ni-mono text-violet-300/70">{r.scores ? r.scores.confidence : "—"}</td>
-                      <td className="max-w-[100px] truncate text-[10px] text-white/50">{r.endpoint.isp}</td>
-                      <td>
-                        <input
-                          type="checkbox"
-                          checked={compareIds.includes(r.endpoint.id)}
-                          onChange={() => toggleCompare(r.endpoint.id)}
-                          onClick={(e) => e.stopPropagation()}
-                          className="h-3 w-3 accent-orange-500"
-                        />
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+      {/* Master dataset stats */}
+      <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+        {(tab === "dns"
+          ? [[t("dns_master", lang), DNS_HOSTS.length], [t("dns_duplicates", lang), DNS_HOSTS.length - new Set(DNS_HOSTS.map((h) => h.ip)).size], [t("dns_analyzed", lang), dns.length || "—"], [t("dns_results", lang), SELECTABLE.length]]
+          : [[t("dns_master", lang), PROXY_RAW_COUNT], [t("dns_duplicates", lang), PROXY_DUPLICATES_REMOVED], [t("dns_analyzed", lang), proxy.length || "—"], [t("dns_results", lang), PROXY_POOL.length]]
+        ).map(([label, value]) => (
+          <div key={String(label)} className="rounded-xl border border-white/5 bg-black/30 p-2.5 text-center">
+            <p className="font-display text-base font-black text-white tabular-nums">{value}</p>
+            <p className="text-[9px] text-white/35">{label}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Actions */}
+      <div className="mb-3 flex flex-wrap gap-2">
+        <button onClick={() => void run()} disabled={scanning} className="btn-primary rounded-xl px-4 py-2.5 text-xs disabled:opacity-60">
+          {scanning ? t("dns_scanning", lang) : t("dns_scan", lang)}
+        </button>
+        <button onClick={match} disabled={!best.length || !bestProxy.length} className="btn-ghost rounded-xl px-4 py-2.5 text-xs font-semibold disabled:opacity-40">
+          {t("proxy_match_btn", lang)}
+        </button>
+        {scanning && (
+          <button onClick={() => { stopRef.current = true; }} className="btn-ghost rounded-xl px-4 py-2.5 text-xs font-semibold text-red-300">
+            ⏹ {isAr ? "إيقاف" : "Stop"}
+          </button>
+        )}
+      </div>
+
+      {/* Progress */}
+      {scanning && (
+        <div className="mb-4 rounded-xl border border-white/5 bg-black/30 p-3">
+          <div className="mb-1.5 flex items-center justify-between text-[10px]">
+            <span className="font-display font-bold tracking-widest text-orange-300">⚡ {phaseLabel[progress.phase]} · {progress.done}/{progress.total}</span>
+            <span className="text-white/40">{pct}%</span>
+          </div>
+          <div className="stat-bar h-1.5"><span className="block h-full" style={{ width: `${pct}%`, transition: "width .25s ease" }} /></div>
+          <p className="mt-1.5 text-[9px] text-white/35">
+            {isAr ? "استعلام DNS حقيقي + HTTP CONNECT من الخادم، و٤ اختبارات متوازية من المتصفح." : "Real DNS query + HTTP CONNECT from the edge, plus 4 parallel browser probes."}
+          </p>
+        </div>
+      )}
+      {!scanning && elapsed !== null && (
+        <p className="mb-3 text-center text-[10px] font-semibold text-emerald-300">
+          ⚡ {isAr ? "اكتمل الفحص في" : "Completed in"} {elapsed}ms{edgeSource ? ` · ${edgeSource}` : ""}
+        </p>
+      )}
+      {!scanning && elapsed !== null && !edgeSource && (
+        <p className="mb-4 rounded-xl border border-amber-500/20 bg-amber-500/5 p-2.5 text-center text-[10px] text-amber-200/80">
+          ⚠️ {isAr
+            ? "الفحص الكامل (UDP/53 + HTTP CONNECT) يعمل عبر دالة Netlify — انشر المستودع على Netlify لتفعيله. حالياً تُستخدم اختبارات المتصفح الحقيقية فقط."
+            : "Full probing (UDP/53 + HTTP CONNECT) runs through the Netlify function — deploy the repo to Netlify to enable it. Only real browser probes are used right now."}
+        </p>
+      )}
+
+      {/* Status census */}
+      {(dns.length || proxy.length) > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-1.5 rounded-xl border border-white/5 bg-black/30 p-2.5">
+          <span className="me-1 font-display text-[9px] font-bold tracking-widest text-white/40">STATUS</span>
+          {census.map(([key, count]) => (
+            <span key={key} className="flex items-center gap-1">
+              {tab === "dns" ? <DnsChip label={key as DnsLabel} /> : <StatusChip status={key as EndpointStatus} />}
+              <span className="font-display text-[10px] font-bold text-white/70 tabular-nums">×{count}</span>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Match result */}
+      {matched && (
+        <div className="mb-4 rounded-xl border border-orange-500/25 bg-orange-500/5 p-4">
+          <p className="mb-2 font-display text-xs font-bold text-orange-300">{t("proxy_match_title", lang)}</p>
+          <p className="mb-3 text-[10px] text-white/45">{t("proxy_match_sub", lang)}</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="rounded-lg border border-white/5 bg-black/30 p-3">
+              <p className="text-[9px] font-bold tracking-widest text-sky-300">🛰️ DNS · {t("dns_primary", lang)}</p>
+              <p className="font-mono text-sm text-white">{matched.dns.host.ip}</p>
+              <p className="text-[10px] text-white/40">{matched.dns.host.isp} · {matched.dns.host.asn ?? "—"}</p>
+              <div className="mt-1 flex items-center gap-2"><DnsChip label={matched.dns.label} /><span className="text-[10px] text-orange-300">{matched.dns.score ?? "—"} pts</span></div>
+            </div>
+            <div className="rounded-lg border border-white/5 bg-black/30 p-3">
+              <p className="text-[9px] font-bold tracking-widest text-emerald-300">🛡️ PROXY</p>
+              <p className="font-mono text-sm text-white">{matched.proxy.entry.host}:{matched.proxy.entry.port}</p>
+              <p className="text-[10px] text-white/40">{matched.proxy.entry.isp} · {matched.proxy.entry.asn}</p>
+              <div className="mt-1 flex items-center gap-2"><StatusChip status={matched.proxy.status} /><span className="text-[10px] text-orange-300">{matched.proxy.score ?? "—"} pts · {matched.proxy.avg ?? "—"}ms</span></div>
+            </div>
+          </div>
+          <p className="mt-2 text-[10px] font-semibold text-white/60">
+            {matched.sameAsn ? `✅ ${t("proxy_match_same_asn", lang)}` : `🔀 ${t("proxy_match_cross", lang)}`}
+          </p>
+        </div>
+      )}
+
+      {tab === "region" ? (
+        <RegionRouter />
+      ) : tab === "dns" ? (
+        <>
+          {yourNetworkDns.length > 0 && (
+            <div className="mb-4 rounded-xl border border-sky-500/20 bg-sky-500/5 p-3">
+              <p className="mb-1 text-[11px] font-bold text-sky-300">{t("dns_your_network", lang)}</p>
+              <p className="mb-2 text-[10px] text-white/40">{t("dns_your_network_sub", lang)}</p>
+              <div className="grid gap-1.5 sm:grid-cols-2">
+                {yourNetworkDns.slice(0, 8).map((r) => (
+                  <div key={r.host.ip} className="flex items-center gap-2 rounded-lg border border-white/5 bg-black/30 p-2">
+                    <span className="font-mono text-xs text-white">{r.host.ip}</span>
+                    <span className="ms-auto text-[10px] text-emerald-300">{r.avg ?? "—"}ms</span>
+                    <DnsChip label={r.label} />
+                  </div>
+                ))}
+              </div>
             </div>
           )}
-        </div>
 
-        {/* Activity Feed */}
-        <div className="hidden border-s border-white/5 p-3 lg:block">
-          <div className="mb-2 font-display text-[9px] font-bold tracking-widest text-white/50">
-            {label("النشاط", "ACTIVITY")}
-          </div>
-          <ActivityFeed entries={activity} />
-        </div>
-      </div>
+          {dns.some((r) => r.samples.length > 0) && (
+            <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {(() => {
+                const all = dns.flatMap((r) => r.samples);
+                return ([[t("dns_avg", lang), all.length ? Math.round(all.reduce((a, b) => a + b, 0) / all.length) : "—"], [t("dns_median", lang), all.length ? median(all) : "—"], [t("dns_p95", lang), all.length ? p95Of(all) : "—"], [t("dns_samples", lang), all.length]] as const)
+                  .map(([label, value]) => (
+                    <div key={label} className="rounded-xl border border-white/5 bg-black/30 p-2.5 text-center">
+                      <p className="font-display text-base font-black text-white tabular-nums">{value}</p>
+                      <p className="text-[9px] text-white/35">{label}</p>
+                    </div>
+                  ));
+              })()}
+            </div>
+          )}
 
-      {/* ═══ COMPARISON PANEL ═══ */}
-      {compareRecords.length >= 2 && (
-        <div className="border-t border-white/8 bg-[var(--s2)] p-4">
-          <div className="mb-3 flex items-center justify-between">
-            <span className="font-display text-[10px] font-bold tracking-widest text-violet-300">
-              {label("مقارنة النقاط", "ENDPOINT COMPARISON")}
-            </span>
-            <button onClick={() => setCompareIds([])} className="text-[10px] text-white/40 hover:text-white/70">✕ {label("إغلاق", "Close")}</button>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="ni-table">
-              <thead>
-                <tr>
-                  <th>{label("المقياس", "Metric")}</th>
-                  {compareRecords.map((r) => <th key={r.endpoint.id} className="font-mono">{r.endpoint.host}</th>)}
+          {pair && (
+            <div className="mb-4 grid gap-2 sm:grid-cols-2">
+              {[t("dns_best", lang), t("dns_second", lang)].map((label, i) => {
+                const r = i === 0 ? pair.primary : pair.secondary;
+                if (!r) return null;
+                const d = withDistance ? withDistance(r.host.ip) : null;
+                return (
+                  <div key={label} className="rounded-xl border border-orange-500/25 bg-gradient-to-br from-orange-500/10 to-transparent p-3">
+                    <p className="text-[9px] font-bold tracking-widest text-orange-300">
+                      {label}{i === 1 && r.host.asn !== pair.primary.host.asn ? " · 🔀 diverse ASN" : ""}
+                    </p>
+                    <p className="font-mono text-lg font-bold text-white">{r.host.ip}</p>
+                    <p className="text-[10px] text-white/45">{r.host.isp} · {r.host.asn ?? "—"} · {r.city}{d ? ` · ${d.km}km` : ""}</p>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5"><DnsChip label={r.label} /><span className="text-[10px] font-bold text-orange-300">{r.score ?? "—"} pts</span></div>
+                    <div className="mt-2 grid grid-cols-3 gap-1 text-center">
+                      <div><p className="font-display text-sm font-bold text-white">{r.avg ?? "—"}</p><p className="text-[8px] text-white/35">{t("dns_avg", lang)}</p></div>
+                      <div><p className="font-display text-sm font-bold text-white">{r.jitter ?? "—"}</p><p className="text-[8px] text-white/35">{t("dns_jitter", lang)}</p></div>
+                      <div><p className="font-display text-sm font-bold text-white">{r.p95 ?? "—"}</p><p className="text-[8px] text-white/35">P95</p></div>
+                    </div>
+                    <p className="mt-2 text-[10px] text-emerald-300/80">
+                      💡 {t("dns_explain", lang)}: {r.avg !== null ? `${r.avg}ms · Jitter ${r.jitter ?? 0}ms · ${r.samples.length} ${isAr ? "قياسات" : "samples"}` : (isAr ? "بدون قياس" : "no measurement")}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div className="max-h-[26rem] overflow-auto">
+            <table className="w-full text-left text-[11px]">
+              <thead className="sticky top-0 bg-[#0c0700]">
+                <tr className="border-b border-white/10 text-[9px] uppercase tracking-wider text-white/35">
+                  <th className="p-2">#</th><th className="p-2">IP</th><th className="p-2">{t("dns_isp", lang)}</th>
+                  <th className="p-2">{t("dns_status", lang)}</th><th className="p-2">RCODE</th>
+                  <th className="p-2">{t("dns_search_domain", lang)}</th><th className="p-2">{t("dns_avg", lang)}</th>
+                  <th className="p-2">P95</th><th className="p-2">{t("dns_gscore", lang)}</th>
                 </tr>
               </thead>
               <tbody>
-                {[
-                  { l: "P50 (ms)", get: (r: EndpointRecord) => r.metrics?.p50 ?? "—" },
-                  { l: "P95 (ms)", get: (r: EndpointRecord) => r.metrics?.p95 ?? "—" },
-                  { l: "Jitter (ms)", get: (r: EndpointRecord) => r.metrics?.jitter ?? "—" },
-                  { l: "Reliability", get: (r: EndpointRecord) => r.scores?.reliability ?? "—" },
-                  { l: "Overall", get: (r: EndpointRecord) => r.scores?.overall ?? "—" },
-                  { l: "Confidence", get: (r: EndpointRecord) => r.scores?.confidence ?? "—" },
-                  { l: "DNS UDP", get: (r: EndpointRecord) => r.verification.dnsUdp },
-                  { l: "NXDOMAIN", get: (r: EndpointRecord) => r.verification.nxdomain },
-                  { l: "DNSSEC", get: (r: EndpointRecord) => r.verification.dnssec },
-                ].map((row) => (
-                  <tr key={row.l}>
-                    <td className="text-white/50">{row.l}</td>
-                    {compareRecords.map((r) => <td key={r.endpoint.id} className="ni-mono text-white/80">{row.get(r)}</td>)}
+                {best.map((r, i) => (
+                  <tr key={r.host.ip} className={`border-b border-white/5 ${DNS_LABEL_META[r.label].dim ? "opacity-40" : ""}`}>
+                    <td className="p-2 font-display font-bold text-white/50">{i + 1}</td>
+                    <td className="p-2 font-mono text-white/90">{r.host.ip}</td>
+                    <td className="p-2 text-white/60">{r.host.isp}</td>
+                    <td className="p-2"><DnsChip label={r.label} /></td>
+                    <td className="p-2 font-mono text-[10px] text-white/50">{r.rcode ?? "—"}</td>
+                    <td className="p-2 font-mono text-[10px] text-white/40">{r.host.searchDomain}</td>
+                    <td className="p-2 tabular-nums text-white/80">{r.avg ?? "—"}</td>
+                    <td className="p-2 tabular-nums text-white/60">{r.p95 ?? "—"}</td>
+                    <td className="p-2 font-display font-bold text-orange-300">{r.score ?? "—"}</td>
                   </tr>
                 ))}
+                {!dns.length && <tr><td colSpan={9} className="p-6 text-center text-white/35">{t("dns_no_data", lang)}</td></tr>}
               </tbody>
             </table>
           </div>
+          {dns.length > 0 && <p className="mt-3 text-[10px] leading-relaxed text-white/35">{t("dns_legend", lang)}</p>}
+        </>
+      ) : (
+        <div className="max-h-[26rem] overflow-auto">
+          <table className="w-full text-left text-[11px]">
+            <thead className="sticky top-0 bg-[#0c0700]">
+              <tr className="border-b border-white/10 text-[9px] uppercase tracking-wider text-white/35">
+                <th className="p-2">#</th><th className="p-2">ENDPOINT</th><th className="p-2">{t("dns_isp", lang)}</th>
+                <th className="p-2">{t("dns_status", lang)}</th><th className="p-2">EVIDENCE</th><th className="p-2">STATE</th>
+                <th className="p-2">{t("dns_avg", lang)}</th><th className="p-2">{t("dns_jitter", lang)}</th><th className="p-2">{t("dns_gscore", lang)}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bestProxy.map((r, i) => (
+                <tr key={`${r.entry.host}:${r.entry.port}`} className={`border-b border-white/5 ${r.status === "FAILED" || r.status === "TIMEOUT" ? "opacity-40" : ""}`}>
+                  <td className="p-2 font-display font-bold text-white/50">{i + 1}</td>
+                  <td className="p-2 font-mono text-white/90">{r.entry.host}:{r.entry.port}</td>
+                  <td className="p-2 text-white/60">{r.entry.isp}</td>
+                  <td className="p-2"><StatusChip status={r.status} /></td>
+                  <td className="p-2 font-mono text-[9px] text-white/45">{r.evidence}</td>
+                  <td className="p-2 text-[9px] font-bold text-white/45">{r.entry.state === "confirmed" ? "✔" : "○"}</td>
+                  <td className="p-2 tabular-nums text-white/80">{r.avg ?? "—"}</td>
+                  <td className="p-2 tabular-nums text-white/60">{r.jitter ?? "—"}</td>
+                  <td className="p-2 font-display font-bold text-orange-300">{r.score ?? "—"}</td>
+                </tr>
+              ))}
+              {!bestProxy.length && <tr><td colSpan={9} className="p-6 text-center text-white/35">{t("dns_no_data", lang)}</td></tr>}
+            </tbody>
+          </table>
+          {bestProxy.length > 0 && (
+            <p className="mt-3 text-[10px] leading-relaxed text-white/35">
+              {bestProxy[0].source === "NETLIFY_EDGE_PROBE"
+                ? "HTTP CONNECT handshakes and TCP connects are measured by the edge probe function; latency is measured from that region, not from the user's Wi-Fi."
+                : "Browser-only mode: HTTPS reachability is measured for real. Deploy on Netlify to enable the real HTTP CONNECT / TCP probing."}
+            </p>
+          )}
         </div>
       )}
 
-      {/* ═══ EVIDENCE DRAWER ═══ */}
-      {selectedRecord && (
-        <EvidenceDrawer
-          record={selectedRecord}
-          onClose={() => setSelected(null)}
-        />
-      )}
+      <p className="mt-4 rounded-xl border border-amber-500/20 bg-amber-500/5 p-3 text-[10px] leading-relaxed text-amber-200/70">
+        ⚠️ {t("dns_disclaimer", lang)}
+      </p>
     </div>
   );
 }
